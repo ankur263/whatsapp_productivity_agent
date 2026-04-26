@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import time
+
+import google.generativeai as genai
 from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -45,15 +47,13 @@ Be strictly compliant with the JSON schema.
 
 class SupervisorAgent:
     def __init__(self) -> None:
-        self.model_name = os.getenv("GEMINI_SUPERVISOR_MODEL", "gemini-2.5-flash")
+        self.model_name = os.getenv("GEMINI_SUPERVISOR_MODEL", "gemini-1.5-flash-latest")
         self._model = None
         
     def _get_model(self):
         if self._model is not None:
             return self._model
             
-        import google.generativeai as genai  # type: ignore
-        
         api_key = os.getenv("GOOGLE_API_KEY", "").strip()
         if not api_key:
             logger.warning("GOOGLE_API_KEY not set for SupervisorAgent.")
@@ -86,8 +86,6 @@ class SupervisorAgent:
         return self._call_with_retries(prompt)
         
     def _call_with_retries(self, prompt: str) -> SupervisorOutput | None:
-        import google.generativeai as genai
-        
         model = self._get_model()
         config = genai.GenerationConfig(
             response_mime_type="application/json",

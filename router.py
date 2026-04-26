@@ -6,12 +6,19 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Dict
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Fallback for Python < 3.9
+    from backports.zoneinfo import ZoneInfo
 
 from agent import Agent
 from database import TaskDatabase
 from supervisor import SupervisorAgent
 from planner import PlannerAgent
 from events_agent import EventsAgent
+from finance_agent import FinanceAgent
+from shopping_agent import ShoppingAgent
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +42,8 @@ class AgentRouter:
         self.supervisor = SupervisorAgent()
         self.planner = PlannerAgent()
         self.events = EventsAgent()
+        self.finance = FinanceAgent()
+        self.shopping = ShoppingAgent()
 
     def _get_agent(self, user_id: str) -> Agent:
         if user_id not in self.agents:
@@ -56,6 +65,14 @@ class AgentRouter:
         settings = self.db.get_user_settings(user_id)
         if not settings or settings.get("onboarding_state") != "complete":
             return self._handle_onboarding(user_id, text, settings)
+
+        user_tz_str = (settings or {}).get("timezone", "UTC")
+        try:
+            user_tz = ZoneInfo(user_tz_str)
+        except Exception:
+            logger.warning("Invalid timezone '%s' for user %s, falling back to UTC.", user_tz_str, user_id)
+            user_tz = timezone.utc
+        now_local = datetime.now(user_tz)
 
         # 2. Pre-Router Fast Path (Bypass LLM)
         agent = self._get_agent(user_id)
@@ -112,12 +129,42 @@ class AgentRouter:
                 "original_message": text,
                 "user_settings": settings or {},
                 "recent_turns": recent_turns,
-                "now_local_iso": datetime.now(timezone.utc).isoformat()
+                "now_local_iso": now_local.isoformat()
             }
             self.db.insert_routing_log(user_id, "events", decision.kind, 0, latency_ms, 2)
             result = self.events.handle(bundle)
             reply = result.get("text", "Done.")
             self.db.append_conversation(user_id, "assistant", reply, agent_name="events")
+            return reply
+
+        if decision.kind == "route" and target_agent == "finance":
+            bundle = {
+                "user_id": user_id,
+                "subrequest": decision.subrequest or text,
+                "original_message": text,
+                "user_settings": settings or {},
+                "recent_turns": recent_turns,
+                "now_local_iso": now_local.isoformat()
+            }
+            self.db.insert_routing_log(user_id, "finance", decision.kind, 0, latency_ms, 2)
+            result = self.finance.handle(bundle)
+            reply = result.get("text", "Done.")
+            self.db.append_conversation(user_id, "assistant", reply, agent_name="finance")
+            return reply
+            
+        if decision.kind == "route" and target_agent == "shopping":
+            bundle = {
+                "user_id": user_id,
+                "subrequest": decision.subrequest or text,
+                "original_message": text,
+                "user_settings": settings or {},
+                "recent_turns": recent_turns,
+                "now_local_iso": now_local.isoformat()
+            }
+            self.db.insert_routing_log(user_id, "shopping", decision.kind, 0, latency_ms, 2)
+            result = self.shopping.handle(bundle)
+            reply = result.get("text", "Done.")
+            self.db.append_conversation(user_id, "assistant", reply, agent_name="shopping")
             return reply
             
         self.db.insert_routing_log(user_id, target_agent, decision.kind, 1, latency_ms, 1, "Specialists not implemented, delegated to fallback")

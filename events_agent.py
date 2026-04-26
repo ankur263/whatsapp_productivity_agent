@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 class EventsAgent:
     def __init__(self) -> None:
-        self.model_name = os.getenv("GEMINI_SPECIALIST_MODEL", "gemini-2.5-flash")
+        self.model_name = os.getenv("GEMINI_SPECIALIST_MODEL", "gemini-1.5-flash-latest")
         
     def handle(self, bundle: dict) -> dict:
         user_id = bundle["user_id"]

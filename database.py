@@ -1350,3 +1350,71 @@ class TaskDatabase:
                             (evt["user_id"], f"{msg_prefix} is on {next_dt.strftime('%Y-%m-%d')}!", reminder_dt.isoformat(), _utc_now_iso())
                         )
                         c.connection.commit()
+
+    def log_expense(
+        self,
+        user_id: str,
+        amount_minor: int,
+        currency: str,
+        category: str,
+        merchant: str | None = None,
+        method: str | None = None,
+        card_id: int | None = None,
+        occurred_at: str | None = None,
+    ) -> int:
+        """Logs a new expense, storing money in minor units."""
+        now = _utc_now_iso()
+        with self._conn() as c:
+            # As per plan, amount_home_minor and fx_rate are deferred for now.
+            cur = c.execute(
+                """
+                INSERT INTO expenses(
+                    user_id, amount_minor, currency, merchant, category, method,
+                    card_id, occurred_at, source, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+                """,
+                (
+                    user_id,
+                    amount_minor,
+                    currency,
+                    merchant,
+                    category,
+                    method,
+                    card_id,
+                    occurred_at or now,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_last_expense(self, user_id: str) -> dict | None:
+        """Retrieves the most recently added expense for a user."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_expense(self, user_id: str, expense_id: int) -> bool:
+        """Deletes an expense by its ID."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+                (expense_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def get_expenses_for_period(self, user_id: str, start_date: str, end_date: str) -> list[dict]:
+        """Fetches all expenses for a user within a given date range."""
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT * FROM expenses
+                WHERE user_id = ? AND occurred_at >= ? AND occurred_at < ?
+                ORDER BY occurred_at DESC
+                """,
+                (user_id, start_date, end_date)
+            ).fetchall()
+        return [dict(r) for r in rows]
