@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 import sqlite3
+import uuid
+import random
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -359,6 +362,7 @@ class TaskDatabase:
 
             self._ensure_grocery_schema(c)
             self._ensure_v2_schema(c)
+            self._ensure_v3_schema(c)
 
     def _ensure_grocery_schema(self, conn: sqlite3.Connection) -> None:
         """Apply safe, additive migrations for grocery schema."""
@@ -376,7 +380,7 @@ class TaskDatabase:
             row["name"]
             for row in conn.execute("PRAGMA table_info(user_settings)").fetchall()
         }
-        for col in ["timezone", "locale", "quiet_hours_start", "quiet_hours_end", "onboarding_state"]:
+        for col in ["timezone", "locale", "quiet_hours_start", "quiet_hours_end", "onboarding_state", "family_size"]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE user_settings ADD COLUMN {col} TEXT")
 
@@ -387,6 +391,75 @@ class TaskDatabase:
         }
         if "provider_message_id" not in cols:
             conn.execute("ALTER TABLE reminders ADD COLUMN provider_message_id TEXT")
+
+    def _ensure_v3_schema(self, conn: sqlite3.Connection) -> None:
+        """Apply safe additive migrations for Households and Auth."""
+        c = conn
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS households (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL
+            )
+        """)
+        hh_cols = {row["name"] for row in c.execute("PRAGMA table_info(households)").fetchall()}
+        if "last_digest_sent_at" not in hh_cols:
+            c.execute("ALTER TABLE households ADD COLUMN last_digest_sent_at TEXT")
+            
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS household_members (
+                household_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (household_id, user_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS invites (
+                code TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_by TEXT
+            )
+        """)
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(user_settings)").fetchall()}
+        if "is_allowed" not in cols:
+            c.execute("ALTER TABLE user_settings ADD COLUMN is_allowed INTEGER DEFAULT 0")
+        if "active_household_id" not in cols:
+            c.execute("ALTER TABLE user_settings ADD COLUMN active_household_id TEXT")
+
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(grocery_items)").fetchall()}
+        if "household_id" not in cols:
+            c.execute("ALTER TABLE grocery_items ADD COLUMN household_id TEXT")
+        if "added_by_user_id" not in cols:
+            c.execute("ALTER TABLE grocery_items ADD COLUMN added_by_user_id TEXT")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_clarifications (
+                user_id TEXT PRIMARY KEY,
+                original_message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(inventory_items)").fetchall()}
+        if "household_id" not in cols:
+            c.execute("ALTER TABLE inventory_items ADD COLUMN household_id TEXT")
+        
+        c.execute("DROP INDEX IF EXISTS idx_inventory_unique_item")
+        try:
+            c.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_unique_item_v3
+                ON inventory_items(IFNULL(household_id, user_id), normalized_name, unit)
+                """
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _normalize_grocery_name(item_name: str) -> str:
@@ -446,6 +519,119 @@ class TaskDatabase:
                 (task_id, user_id),
             )
             return cur.rowcount > 0
+
+    def get_active_household(self, user_id: str) -> str | None:
+        with self._conn() as c:
+            row = c.execute("SELECT active_household_id FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+        return row["active_household_id"] if row and row["active_household_id"] else None
+
+    def create_household(self, user_id: str, name: str) -> str:
+        hh_id = "hh_" + uuid.uuid4().hex[:8]
+        now = _utc_now_iso()
+        with self._conn() as c:
+            c.execute("INSERT INTO households(id, name, created_at, created_by) VALUES (?, ?, ?, ?)", (hh_id, name, now, user_id))
+            c.execute("INSERT INTO household_members(household_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)", (hh_id, user_id, now))
+            c.execute(
+                "INSERT INTO user_settings(user_id, created_at, updated_at, active_household_id) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET active_household_id = ?",
+                (user_id, now, now, hh_id, hh_id)
+            )
+        return hh_id
+
+    def get_user_households(self, user_id: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT h.id, h.name, m.role FROM households h JOIN household_members m ON h.id = m.household_id WHERE m.user_id = ?", (user_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_households(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM households").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_household_owner(self, household_id: str) -> str | None:
+        with self._conn() as c:
+            row = c.execute("SELECT user_id FROM household_members WHERE household_id = ? AND role = 'owner' LIMIT 1", (household_id,)).fetchone()
+        return row["user_id"] if row else None
+
+    def get_recent_bought_events(self, household_id: str, days: int = 60) -> list[str]:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self._conn() as c:
+            rows = c.execute("SELECT updated_at FROM grocery_items WHERE household_id = ? AND status = 'bought' AND updated_at >= ?", (household_id, since)).fetchall()
+        return [r["updated_at"] for r in rows]
+
+    def mark_digest_sent(self, household_id: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE households SET last_digest_sent_at = ? WHERE id = ?", (_utc_now_iso(), household_id))
+
+    def leave_household(self, user_id: str, household_id: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM household_members WHERE household_id = ? AND user_id = ?", (household_id, user_id))
+            if cur.rowcount > 0:
+                row = c.execute("SELECT active_household_id FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+                if row and row["active_household_id"] == household_id:
+                    c.execute("UPDATE user_settings SET active_household_id = NULL WHERE user_id = ?", (user_id,))
+                return True
+        return False
+
+    def create_invite(self, household_id: str, user_id: str) -> str:
+        code = str(random.randint(100000, 999999))
+        now = _utc_now_iso()
+        exp = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        with self._conn() as c:
+            c.execute("INSERT INTO invites(code, household_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)", (code, household_id, user_id, now, exp))
+        return code
+
+    def consume_invite(self, user_id: str, code: str) -> dict | None:
+        now = _utc_now_iso()
+        with self._conn() as c:
+            inv = c.execute("SELECT household_id, expires_at, used_by FROM invites WHERE code = ?", (code,)).fetchone()
+            if not inv or inv["used_by"] or inv["expires_at"] < now:
+                return None
+            hh_id = inv["household_id"]
+            
+            existing = c.execute("SELECT 1 FROM household_members WHERE household_id = ? AND user_id = ?", (hh_id, user_id)).fetchone()
+            if not existing:
+                c.execute("INSERT INTO household_members(household_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)", (hh_id, user_id, now))
+            
+            c.execute("UPDATE invites SET used_by = ? WHERE code = ?", (user_id, code))
+            c.execute(
+                "INSERT INTO user_settings(user_id, created_at, updated_at, is_allowed, active_household_id) VALUES (?, ?, ?, 1, ?) ON CONFLICT(user_id) DO UPDATE SET is_allowed = 1, active_household_id = ?",
+                (user_id, now, now, hh_id, hh_id)
+            )
+            hh = c.execute("SELECT name FROM households WHERE id = ?", (hh_id,)).fetchone()
+            return {"household_id": hh_id, "name": hh["name"]}
+
+    def set_pending_clarification(self, user_id: str, original_message: str) -> None:
+        now = _utc_now_iso()
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO pending_clarifications(user_id, original_message, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET original_message = excluded.original_message, created_at = excluded.created_at
+                """,
+                (user_id, original_message, now)
+            )
+
+    def get_and_clear_pending_clarification(self, user_id: str, max_age_minutes: int = 5) -> str | None:
+        with self._conn() as c:
+            row = c.execute("SELECT original_message, created_at FROM pending_clarifications WHERE user_id = ?", (user_id,)).fetchone()
+            if row:
+                c.execute("DELETE FROM pending_clarifications WHERE user_id = ?", (user_id,))
+                created_at = datetime.fromisoformat(row["created_at"])
+                if (datetime.now(timezone.utc) - created_at).total_seconds() < max_age_minutes * 60:
+                    return str(row["original_message"])
+        return None
+
+    def _household_scope(self, user_id: str, override_hh_id: str | None = None) -> tuple[str, tuple, str | None]:
+        if override_hh_id:
+            return "household_id = ?", (override_hh_id,), override_hh_id
+        hh = self.get_active_household(user_id)
+        if hh:
+            return "household_id = ?", (hh,), hh
+        return "user_id = ? AND household_id IS NULL", (user_id,), None
+
+    def _grocery_scope(self, user_id: str, override_hh_id: str | None = None) -> tuple[str, tuple, str | None]:
+        return self._household_scope(user_id, override_hh_id)
 
     def add_grocery_item(
         self,
@@ -508,17 +694,18 @@ class TaskDatabase:
         clean_unit = unit.strip() or "unit"
         clean_category = category.strip() or "other"
         now = _utc_now_iso()
+        cond, p, hh_id = self._grocery_scope(user_id)
 
         with self._conn() as c:
             row = c.execute(
-                """
+                f"""
                 SELECT id, qty, category, unit_price
                 FROM grocery_items
-                WHERE user_id = ? AND normalized_name = ? AND status = 'pending' AND unit = ?
+                WHERE {cond} AND normalized_name = ? AND status = 'pending' AND unit = ?
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (user_id, normalized_name, clean_unit),
+                (*p, normalized_name, clean_unit),
             ).fetchone()
 
             if row:
@@ -533,12 +720,12 @@ class TaskDatabase:
                 else:
                     price_to_set = None
                 c.execute(
-                    """
+                    f"""
                     UPDATE grocery_items
                     SET qty = ?, category = ?, unit_price = ?, updated_at = ?
-                    WHERE id = ? AND user_id = ?
+                    WHERE id = ? AND {cond}
                     """,
-                    (new_qty, category_to_set, price_to_set, now, int(row["id"]), user_id),
+                    (new_qty, category_to_set, price_to_set, now, int(row["id"]), *p),
                 )
                 return {
                     "id": int(row["id"]),
@@ -551,11 +738,13 @@ class TaskDatabase:
             cur = c.execute(
                 """
                 INSERT INTO grocery_items(
-                    user_id, item_name, normalized_name, qty, unit, unit_price, category, status, created_at, updated_at
+                    user_id, household_id, added_by_user_id, item_name, normalized_name, qty, unit, unit_price, category, status, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
+                    user_id,
+                    hh_id,
                     user_id,
                     clean_name,
                     normalized_name,
@@ -575,41 +764,43 @@ class TaskDatabase:
                 "status": "pending",
             }
 
-    def list_grocery_items(self, user_id: str, status: str | None = None) -> list[dict]:
+    def list_grocery_items(self, user_id: str, status: str | None = None, override_hh_id: str | None = None) -> list[dict]:
         status_filter = (status or "").strip().lower() or None
+        cond, p, _ = self._household_scope(user_id, override_hh_id)
         with self._conn() as c:
             if status_filter and status_filter != "all":
                 rows = c.execute(
-                    """
+                    f"""
                     SELECT id, item_name, qty, unit, unit_price, category, status, created_at, updated_at
                     FROM grocery_items
-                    WHERE user_id = ? AND status = ?
+                    WHERE {cond} AND status = ?
                     ORDER BY id ASC
                     """,
-                    (user_id, status_filter),
+                    (*p, status_filter),
                 ).fetchall()
             else:
                 rows = c.execute(
-                    """
+                    f"""
                     SELECT id, item_name, qty, unit, unit_price, category, status, created_at, updated_at
                     FROM grocery_items
-                    WHERE user_id = ?
+                    WHERE {cond}
                     ORDER BY id ASC
                     """,
-                    (user_id,),
+                    (*p,),
                 ).fetchall()
         return [dict(r) for r in rows]
 
     def get_grocery_item(self, user_id: str, item_id: int) -> dict | None:
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             row = c.execute(
-                """
+                f"""
                 SELECT id, item_name, normalized_name, qty, unit, unit_price, category, status, created_at, updated_at
                 FROM grocery_items
-                WHERE user_id = ? AND id = ?
+                WHERE {cond} AND id = ?
                 LIMIT 1
                 """,
-                (user_id, item_id),
+                (*p, item_id),
             ).fetchone()
         return dict(row) if row else None
 
@@ -617,28 +808,30 @@ class TaskDatabase:
         clean_category = category.strip().lower()
         if not clean_category:
             raise ValueError("Category cannot be empty.")
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             cur = c.execute(
-                """
+                f"""
                 UPDATE grocery_items
                 SET category = ?, updated_at = ?
-                WHERE id = ? AND user_id = ?
+                WHERE id = ? AND {cond}
                 """,
-                (clean_category, _utc_now_iso(), item_id, user_id),
+                (clean_category, _utc_now_iso(), item_id, *p),
             )
             return cur.rowcount > 0
 
     def set_grocery_unit_price(self, user_id: str, item_id: int, unit_price: float) -> bool:
         if unit_price <= 0:
             raise ValueError("Unit price must be greater than zero.")
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             cur = c.execute(
-                """
+                f"""
                 UPDATE grocery_items
                 SET unit_price = ?, updated_at = ?
-                WHERE id = ? AND user_id = ?
+                WHERE id = ? AND {cond}
                 """,
-                (float(unit_price), _utc_now_iso(), item_id, user_id),
+                (float(unit_price), _utc_now_iso(), item_id, *p),
             )
             return cur.rowcount > 0
 
@@ -686,37 +879,40 @@ class TaskDatabase:
         }
 
     def mark_grocery_bought(self, user_id: str, item_id: int) -> bool:
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             cur = c.execute(
-                """
+                f"""
                 UPDATE grocery_items
                 SET status = 'bought', updated_at = ?
-                WHERE id = ? AND user_id = ?
+                WHERE id = ? AND {cond}
                 """,
-                (_utc_now_iso(), item_id, user_id),
+                (_utc_now_iso(), item_id, *p),
             )
             return cur.rowcount > 0
 
     def remove_grocery_item(self, user_id: str, item_id: int) -> bool:
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             cur = c.execute(
-                "DELETE FROM grocery_items WHERE id = ? AND user_id = ?",
-                (item_id, user_id),
+                f"DELETE FROM grocery_items WHERE id = ? AND {cond}",
+                (item_id, *p),
             )
             return cur.rowcount > 0
 
     def clear_grocery_items(self, user_id: str, status: str | None = None) -> int:
         status_filter = (status or "").strip().lower() or None
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             if status_filter and status_filter != "all":
                 cur = c.execute(
-                    "DELETE FROM grocery_items WHERE user_id = ? AND status = ?",
-                    (user_id, status_filter),
+                    f"DELETE FROM grocery_items WHERE {cond} AND status = ?",
+                    (*p, status_filter),
                 )
             else:
                 cur = c.execute(
-                    "DELETE FROM grocery_items WHERE user_id = ?",
-                    (user_id,),
+                    f"DELETE FROM grocery_items WHERE {cond}",
+                    (*p,),
                 )
             return int(cur.rowcount)
 
@@ -729,9 +925,10 @@ class TaskDatabase:
         if days <= 0:
             raise ValueError("Days must be > 0.")
         since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cond, p, _ = self._grocery_scope(user_id)
         with self._conn() as c:
             rows = c.execute(
-                """
+                f"""
                 SELECT
                     MIN(item_name) AS item_name,
                     normalized_name,
@@ -739,14 +936,15 @@ class TaskDatabase:
                     category,
                     AVG(qty) AS avg_qty,
                     COUNT(*) AS times_bought,
-                    MAX(updated_at) AS last_bought_at
+                    MAX(updated_at) AS last_bought_at,
+                    MIN(updated_at) AS first_bought_at
                 FROM grocery_items
-                WHERE user_id = ? AND status = 'bought' AND updated_at >= ?
+                WHERE {cond} AND status = 'bought' AND updated_at >= ?
                 GROUP BY normalized_name, unit, category
                 ORDER BY times_bought DESC, last_bought_at DESC
                 LIMIT ?
                 """,
-                (user_id, since_iso, limit),
+                (*p, since_iso, limit),
             ).fetchall()
 
         created = 0
@@ -774,15 +972,16 @@ class TaskDatabase:
             "days": days,
         }
 
-    def suggest_rebuy_candidates(self, user_id: str, limit: int = 8) -> list[dict]:
+    def suggest_rebuy_candidates(self, user_id: str, limit: int = 8, override_hh_id: str | None = None) -> list[dict]:
+        cond, p, _ = self._household_scope(user_id, override_hh_id)
         with self._conn() as c:
             pending_rows = c.execute(
-                """
+                f"""
                 SELECT normalized_name, unit
                 FROM grocery_items
-                WHERE user_id = ? AND status = 'pending'
+                WHERE {cond} AND status = 'pending'
                 """,
-                (user_id,),
+                (*p,),
             ).fetchall()
             pending_pairs = {
                 (str(r["normalized_name"]), str(r["unit"]))
@@ -790,7 +989,7 @@ class TaskDatabase:
             }
 
             bought_rows = c.execute(
-                """
+                f"""
                 SELECT
                     MIN(item_name) AS item_name,
                     normalized_name,
@@ -798,35 +997,55 @@ class TaskDatabase:
                     category,
                     AVG(qty) AS avg_qty,
                     COUNT(*) AS times_bought,
-                    MAX(updated_at) AS last_bought_at
+                    MAX(updated_at) AS last_bought_at,
+                    MIN(updated_at) AS first_bought_at
                 FROM grocery_items
-                WHERE user_id = ? AND status = 'bought'
+                WHERE {cond} AND status = 'bought'
                 GROUP BY normalized_name, unit, category
                 HAVING COUNT(*) >= 2
                 ORDER BY times_bought DESC, last_bought_at DESC
                 LIMIT 100
                 """,
-                (user_id,),
+                (*p,),
             ).fetchall()
 
         suggestions: list[dict] = []
+        now = datetime.now(timezone.utc)
+        
         for row in bought_rows:
             key = (str(row["normalized_name"]), str(row["unit"]))
             if key in pending_pairs:
                 continue
+                
+            first_bought = datetime.fromisoformat(str(row["first_bought_at"]))
+            last_bought = datetime.fromisoformat(str(row["last_bought_at"]))
+            times_bought = int(row["times_bought"])
+            
+            # Calculate consumption velocity (average days between purchases)
+            total_days = (last_bought - first_bought).total_seconds() / 86400.0
+            velocity_days = total_days / (times_bought - 1) if times_bought > 1 else 0.0
+            days_since_last = (now - last_bought).total_seconds() / 86400.0
+            
+            # Flag as due if we are at >= 80% of the normal consumption cycle
+            is_due = bool(velocity_days > 0 and days_since_last >= (velocity_days * 0.8))
+            
             suggestions.append(
                 {
                     "item_name": str(row["item_name"]),
                     "unit": str(row["unit"]),
                     "category": str(row["category"]),
                     "avg_qty": round(float(row["avg_qty"] or 1.0), 2),
-                    "times_bought": int(row["times_bought"]),
+                    "times_bought": times_bought,
                     "last_bought_at": str(row["last_bought_at"]),
+                    "velocity_days": round(velocity_days, 1),
+                    "days_since_last": round(days_since_last, 1),
+                    "is_due": is_due
                 }
             )
-            if len(suggestions) >= limit:
-                break
-        return suggestions
+            
+        # Sort suggestions: Due items first, then by most frequently bought
+        suggestions.sort(key=lambda x: (not x["is_due"], -x["times_bought"]))
+        return suggestions[:limit]
 
     def record_store_price(
         self,
@@ -867,15 +1086,16 @@ class TaskDatabase:
 
     def compare_store_prices(self, user_id: str, item_name: str) -> list[dict]:
         normalized_name = self._normalize_grocery_name(item_name)
+        sixty_days_ago = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
         with self._conn() as c:
             rows = c.execute(
                 """
                 SELECT store, unit_price, currency, source, observed_at
                 FROM store_prices
-                WHERE user_id = ? AND normalized_name = ?
+                WHERE user_id = ? AND normalized_name = ? AND observed_at >= ?
                 ORDER BY observed_at DESC
                 """,
-                (user_id, normalized_name),
+                (user_id, normalized_name, sixty_days_ago),
             ).fetchall()
 
         latest_by_store: dict[str, dict] = {}
@@ -1149,6 +1369,41 @@ class TaskDatabase:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def search_notes(self, user_id: str, query: str, limit: int = 5) -> list[dict]:
+        """Naive substring/keyword search over the user's private notes."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, content, created_at
+                FROM notes
+                WHERE user_id = ? AND LOWER(content) LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, f"%{q.lower()}%", limit),
+            ).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+            tokens = [t for t in re.split(r"\W+", q.lower()) if len(t) >= 3]
+            if not tokens:
+                return []
+            placeholders = " OR ".join(["LOWER(content) LIKE ?"] * len(tokens))
+            params = (user_id, *[f"%{t}%" for t in tokens], limit)
+            rows = c.execute(
+                f"""
+                SELECT id, content, created_at
+                FROM notes
+                WHERE user_id = ? AND ({placeholders})
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def daily_summary(self, user_id: str) -> dict:
         tasks = self.list_tasks(user_id)
         notes = self.list_notes(user_id, limit=5)
@@ -1192,6 +1447,9 @@ class TaskDatabase:
                 "quiet_hours_start",
                 "quiet_hours_end",
                 "onboarding_state",
+                "family_size",
+                "is_allowed",
+                "active_household_id"
             }
             
             if key in allowed_keys:
@@ -1202,6 +1460,22 @@ class TaskDatabase:
             else:
                 raise ValueError(f"Unknown user setting: {key}")
 
+    def delete_user(self, user_id: str) -> None:
+        """Completely removes all data associated with a user."""
+        with self._conn() as c:
+            tables_with_user_id = [
+                "tasks", "reminders", "notes", "grocery_items",
+                "inventory_items", "inventory_events", "store_prices",
+                "user_settings", "events", "expenses", "budgets",
+                "cards", "conversations", "jobs", "routing_log",
+                "pending_clarifications", "household_members"
+            ]
+            for table in tables_with_user_id:
+                c.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+            
+            c.execute("DELETE FROM invites WHERE created_by = ? OR used_by = ?", (user_id, user_id))
+            c.execute("DELETE FROM households WHERE created_by = ?", (user_id,))
+
     def append_conversation(self, user_id: str, role: str, content: str, agent_name: str | None = None) -> None:
         with self._conn() as c:
             c.execute(
@@ -1211,6 +1485,19 @@ class TaskDatabase:
                 """,
                 (user_id, role, content, agent_name, _utc_now_iso()),
             )
+
+    def get_monthly_message_count(self, user_id: str) -> int:
+        now = datetime.now(timezone.utc)
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT COUNT(*) as count FROM conversations 
+                WHERE user_id = ? AND role = 'user' AND created_at >= ?
+                """,
+                (user_id, start_of_month)
+            ).fetchone()
+            return int(row["count"]) if row else 0
 
     def get_last_inbound_time(self, user_id: str) -> str | None:
         with self._conn() as c:
@@ -1359,62 +1646,101 @@ class TaskDatabase:
         category: str,
         merchant: str | None = None,
         method: str | None = None,
-        card_id: int | None = None,
         occurred_at: str | None = None,
     ) -> int:
-        """Logs a new expense, storing money in minor units."""
         now = _utc_now_iso()
+        when = occurred_at or now
         with self._conn() as c:
-            # As per plan, amount_home_minor and fx_rate are deferred for now.
             cur = c.execute(
                 """
                 INSERT INTO expenses(
                     user_id, amount_minor, currency, merchant, category, method,
-                    card_id, occurred_at, source, created_at
+                    occurred_at, source, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    user_id,
-                    amount_minor,
-                    currency,
-                    merchant,
-                    category,
-                    method,
-                    card_id,
-                    occurred_at or now,
-                    now,
-                ),
+                (user_id, int(amount_minor), currency, merchant, category, method,
+                 when, method or "manual", now),
             )
             return int(cur.lastrowid)
 
+    def get_expenses_for_period(self, user_id: str, start_iso: str, end_iso: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT id, amount_minor, currency, merchant, category, method, occurred_at
+                FROM expenses
+                WHERE user_id = ? AND occurred_at >= ? AND occurred_at < ?
+                ORDER BY occurred_at ASC
+                """,
+                (user_id, start_iso, end_iso),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_last_expense(self, user_id: str) -> dict | None:
-        """Retrieves the most recently added expense for a user."""
         with self._conn() as c:
             row = c.execute(
-                "SELECT * FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-                (user_id,)
+                """
+                SELECT id, amount_minor, currency, merchant, category, method, occurred_at
+                FROM expenses
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_id,),
             ).fetchone()
         return dict(row) if row else None
 
     def delete_expense(self, user_id: str, expense_id: int) -> bool:
-        """Deletes an expense by its ID."""
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM expenses WHERE id = ? AND user_id = ?",
-                (expense_id, user_id),
+                (int(expense_id), user_id),
             )
             return cur.rowcount > 0
 
-    def get_expenses_for_period(self, user_id: str, start_date: str, end_date: str) -> list[dict]:
-        """Fetches all expenses for a user within a given date range."""
+    def get_expense_category_stats(self, user_id: str, category: str, currency: str) -> dict | None:
+        """Returns the average amount and total count for a specific expense category."""
         with self._conn() as c:
-            rows = c.execute(
+            row = c.execute(
                 """
-                SELECT * FROM expenses
-                WHERE user_id = ? AND occurred_at >= ? AND occurred_at < ?
-                ORDER BY occurred_at DESC
+                SELECT AVG(amount_minor) as avg_amount, COUNT(*) as count 
+                FROM expenses 
+                WHERE user_id = ? AND category = ? AND currency = ?
                 """,
-                (user_id, start_date, end_date)
-            ).fetchall()
-        return [dict(r) for r in rows]
+                (user_id, category, currency)
+            ).fetchone()
+            if row and row["count"] > 0:
+                return {"avg_amount_minor": float(row["avg_amount"] or 0), "count": int(row["count"])}
+            return None
+
+    def set_budget(self, user_id: str, category: str, monthly_cap_minor: int, currency: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO budgets(user_id, category, monthly_cap_minor, currency)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, category) DO UPDATE SET 
+                    monthly_cap_minor = excluded.monthly_cap_minor, 
+                    currency = excluded.currency
+                """,
+                (user_id, category, monthly_cap_minor, currency)
+            )
+
+    def get_budget(self, user_id: str, category: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT monthly_cap_minor, currency FROM budgets WHERE user_id = ? AND category = ?",
+                (user_id, category)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_current_month_category_total(self, user_id: str, category: str, currency: str) -> int:
+        now = datetime.now(timezone.utc)
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT SUM(amount_minor) as total FROM expenses WHERE user_id = ? AND category = ? AND currency = ? AND occurred_at >= ?",
+                (user_id, category, currency, start_of_month)
+            ).fetchone()
+            return int(row["total"] or 0) if row and row["total"] is not None else 0

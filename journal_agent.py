@@ -6,85 +6,105 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-class EventsAgent:
+class JournalAgent:
     def __init__(self) -> None:
         self.model_name = os.getenv("GROQ_SPECIALIST_MODEL", "llama-3.3-70b-versatile")
         
     def handle(self, bundle: dict) -> dict:
+        from database import TaskDatabase
+        from tools import _memory_store
+        db = TaskDatabase()
         user_id = bundle["user_id"]
         
-        def add_event(title: str, event_date: str, recurrence: str = "", remind_lead_days: int = 1) -> str:
-            from database import TaskDatabase
-            db = TaskDatabase()
-            eid = db.add_event(user_id, title, event_date, recurrence or None, remind_lead_days)
-            return f"Event '{title}' added with ID {eid}."
+        def save_note(content: str) -> str:
+            note_id = db.save_note(user_id, content)
+            return f"Saved note #{note_id}."
             
-        def list_events() -> str:
-            from database import TaskDatabase
-            db = TaskDatabase()
-            events = db.list_events(user_id)
-            if not events:
-                return "No events found."
-            lines = []
-            for e in events:
-                lines.append(f"{e['id']}: {e['title']} on {e['event_date']} (recur: {e['recurrence']})")
-            return "Events:\n" + "\n".join(lines)
+        def list_notes(limit: int = 5) -> str:
+            notes = db.list_notes(user_id, limit=limit)
+            if not notes:
+                return "No notes found."
+            lines = [f"Note {n['id']} ({n['created_at'][:10]}): {n['content']}" for n in notes]
+            return "\n".join(lines)
+            
+        def remember_fact(fact: str) -> str:
+            _memory_store().remember(user_id, fact, metadata={"agent": "journal", "type": "user_fact"})
+            return "Fact remembered."
+            
+        def recall_past(query: str) -> str:
+            # Search both stores: semantic memory (remember_fact) AND saved notes
+            # (save_note). Earlier versions only checked semantic memory, which
+            # missed plain-text private notes.
+            sem = []
+            try:
+                sem = _memory_store().recall(user_id, query, k=5) or []
+            except Exception:
+                sem = []
+            note_rows = db.search_notes(user_id, query, limit=5) or []
+            note_lines = [n["content"] for n in note_rows]
 
-        def delete_event(event_id: int) -> str:
-            from database import TaskDatabase
-            db = TaskDatabase()
-            ok = db.delete_event(user_id, event_id)
-            return "Event deleted." if ok else "Event not found."
+            # De-dup while preserving order (notes first since they're exact matches)
+            seen = set()
+            merged: list[str] = []
+            for item in note_lines + list(sem):
+                key = item.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(item)
+
+            if not merged:
+                return "No relevant memories found."
+            return "Recalled memories:\n" + "\n".join(f"- {r}" for r in merged)
             
         local_tools = {
-            "add_event": add_event,
-            "list_events": list_events,
-            "delete_event": delete_event
+            "save_note": save_note,
+            "list_notes": list_notes,
+            "remember_fact": remember_fact,
+            "recall_past": recall_past
         }
 
         openai_tools = [
             {
                 "type": "function",
                 "function": {
-                    "name": "add_event",
-                    "description": "Adds a life event. event_date must be YYYY-MM-DD. recurrence can be 'yearly', 'monthly', or empty.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "event_date": {"type": "string"},
-                            "recurrence": {"type": "string"},
-                            "remind_lead_days": {"type": "integer"}
-                        },
-                        "required": ["title", "event_date"]
-                    }
+                    "name": "save_note",
+                    "description": "Saves a private, free-form text note for the user.",
+                    "parameters": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}
                 }
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "list_events",
-                    "description": "Lists all life events.",
-                    "parameters": {"type": "object", "properties": {}, "required": []}
+                    "name": "list_notes",
+                    "description": "Lists recently saved private notes.",
+                    "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}, "required": []}
                 }
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "delete_event",
-                    "description": "Deletes an event.",
-                    "parameters": {"type": "object", "properties": {"event_id": {"type": "integer"}}, "required": ["event_id"]}
+                    "name": "remember_fact",
+                    "description": "Stores a fact permanently in the user's semantic memory (e.g., 'My dog is named Max').",
+                    "parameters": {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "recall_past",
+                    "description": "Searches the user's semantic memory for past facts or context.",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 }
             }
         ]
 
         system_instruction = (
-            "You are the Events Specialist. You manage birthdays, anniversaries, and recurring life events.\n"
-            "Use tools to add, list, or delete events. Event dates MUST be YYYY-MM-DD.\n"
-            f"Today's date is {bundle.get('now_local_iso', 'unknown')}.\n"
+            "You are the Journal Specialist. You handle private notes, daily summaries, and memory recall.\n"
+            "All information you store or retrieve is 100% private to this specific user. It is never shared with their household.\n"
+            "Use the provided tools to save notes or recall semantic facts.\n"
             "Always reply with a single, terse sentence starting with a relevant emoji.\n"
-            "Visible Context Cues: Always explicitly echo the scope/household you used in your final reply to catch misroutes.\n"
-            "Mirror the user's language exactly."
+            "Visible Context Cues: Explicitly state that the action was private (e.g., '📝 Saved to your private notes').\n"
+            "Always reply in the same language the user wrote in (English, Hindi, Hinglish, etc.). Mirror their language exactly."
         )
         
         user_msg = bundle.get("subrequest") or bundle.get("original_message")
@@ -129,7 +149,7 @@ class EventsAgent:
                     from tool_fallback import absorb_leaked_calls
                     if absorb_leaked_calls(messages, msg.content or "", local_tools):
                         continue
-                    text = msg.content.strip() if msg.content else "✅ Events task executed."
+                    text = msg.content.strip() if msg.content else "✅ Journal task executed."
                     return {"kind": "reply", "text": text}
             except Exception as e:
                 if attempt == 0 and "429" in str(e):
@@ -138,9 +158,9 @@ class EventsAgent:
                     wait_sec = int(m.group(1)) + 2 if m else 10
                     time.sleep(wait_sec)
                 else:
-                    logger.error("EventsAgent error: %s", e)
-                    return {"kind": "reply", "text": "Sorry, I couldn't process your events request right now."}
-        return {"kind": "reply", "text": "✅ Events task completed."}
+                    logger.error("JournalAgent error: %s", e)
+                    return {"kind": "reply", "text": "Sorry, I couldn't access your journal right now."}
+        return {"kind": "reply", "text": "✅ Journal task completed."}
 
     def _fallback_gemini(self, bundle, local_tools, system_instruction):
         import google.generativeai as genai

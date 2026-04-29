@@ -1,5 +1,6 @@
 flask>=3.0.0
 requests>=2.32.0
 python-dotenv>=1.0.1
-chromadb>=0.5.5
 openai>=1.40.0
+google-generativeai>=0.7.0
+pydantic>=2.7.0

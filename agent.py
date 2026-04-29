@@ -38,7 +38,7 @@ class AgentConfig:
         default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
     )
     gemini_model: str = field(
-        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest").strip()
+        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     )
     max_steps: int = field(
         default_factory=lambda: int(os.getenv("MAX_AGENT_STEPS", "6"))
@@ -50,7 +50,7 @@ class Agent:
     def __init__(self, config: AgentConfig | None = None) -> None:
         self.config = config or AgentConfig()
         self.system_prompt = build_system_prompt(tools_description_text())
-        self.memory = MemoryStore(backend=os.getenv("MEMORY_BACKEND", "chroma"))
+        self.memory = MemoryStore(backend=os.getenv("MEMORY_BACKEND", "sqlite"))
         self.history: dict[str, deque[dict[str, str]]] = defaultdict(
             lambda: deque(maxlen=self.config.max_history)
         )
@@ -566,6 +566,15 @@ class Agent:
             except InvalidArgument as exc:
                 logger.error("Gemini 4xx error: %s", exc)
                 return "Sorry, I'm having trouble with that (4xx error). Please check API keys."
+            except ResourceExhausted as exc:
+                if attempt < max_retries - 1:
+                    m = re.search(r"retry in (\d+)", str(exc))
+                    wait_sec = int(m.group(1)) + 2 if m else 40
+                    logger.warning("Gemini rate limit hit in agent. Waiting %d seconds...", wait_sec)
+                    time.sleep(wait_sec)
+                else:
+                    logger.error("Gemini call failed after %d retries: %s", max_retries, exc)
+                    return "Sorry, I'm having trouble with that — try again in a minute."
             except Exception as exc:
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)

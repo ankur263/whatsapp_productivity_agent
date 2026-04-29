@@ -100,3 +100,23 @@ def send_template_message(to: str, template_name: str, params: list[str]) -> Non
         if resp.status_code == 401:
             msg += " | token may be expired."
         raise WhatsAppClientError(msg)
+
+def download_media(media_id: str) -> bytes:
+    """Fetches media URL from Meta and downloads the raw bytes."""
+    cfg = WhatsAppConfig()
+    if not cfg.access_token:
+        raise WhatsAppClientError("Missing WHATSAPP_ACCESS_TOKEN in environment.")
+
+    url = f"https://graph.facebook.com/{cfg.api_version}/{media_id}"
+    headers = {"Authorization": f"Bearer {cfg.access_token}"}
+    
+    resp = requests.get(url, headers=headers, timeout=20)
+    if resp.status_code >= 400:
+        raise WhatsAppClientError(f"Failed to get media info ({resp.status_code}): {resp.text[:500]}")
+        
+    media_url = resp.json().get("url")
+    dl_resp = requests.get(media_url, headers=headers, timeout=20)
+    if dl_resp.status_code >= 400:
+        raise WhatsAppClientError(f"Failed to download media bytes ({dl_resp.status_code}): {dl_resp.text[:500]}")
+        
+    return dl_resp.content

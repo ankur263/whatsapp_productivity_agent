@@ -5,11 +5,12 @@ import hmac
 import json
 import logging
 import os
+import requests
 import concurrent.futures
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,7 +22,8 @@ from flask import Flask, Response, request  # noqa: E402
 
 from database import TaskDatabase  # noqa: E402
 from router import AgentRouter  # noqa: E402
-from whatsapp_client import WhatsAppClientError, send_text_message, send_template_message  # noqa: E402
+from whatsapp_client import WhatsAppClientError, send_text_message, send_template_message, download_media  # noqa: E402
+import google.generativeai as genai  # noqa: E402
 
 os.makedirs("data", exist_ok=True)
 logging.basicConfig(
@@ -174,6 +176,99 @@ def _start_reminder_thread() -> None:
     t.start()
 
 
+def _start_digest_thread() -> None:
+    def worker() -> None:
+        logger.info("Proactive grocery digest scheduler started.")
+        while True:
+            try:
+                now_utc = datetime.now(timezone.utc)
+                households = db.get_all_households()
+                for hh in households:
+                    # 1. Grace period (Don't spam if sent within 5 days)
+                    if hh.get("last_digest_sent_at"):
+                        try:
+                            last_sent = datetime.fromisoformat(hh["last_digest_sent_at"])
+                            if (now_utc - last_sent).days < 5:
+                                continue
+                        except ValueError:
+                            pass
+
+                    # 2. Get Owner and Timezone
+                    owner_id = db.get_household_owner(hh["id"])
+                    if not owner_id:
+                        continue
+                    
+                    settings = db.get_user_settings(owner_id) or {}
+                    tz_str = settings.get("timezone", "UTC")
+                    try:
+                        from zoneinfo import ZoneInfo
+                        tz = ZoneInfo(tz_str)
+                    except Exception:
+                        tz = timezone.utc
+                        
+                    local_now = now_utc.astimezone(tz)
+                    
+                    # 3. Only calculate & send digests between 5PM and 8PM local time
+                    if not (17 <= local_now.hour <= 20):
+                        continue
+                        
+                    # 4. Shopping Pattern Histogram (Last 60 Days)
+                    events = db.get_recent_bought_events(hh["id"], days=60)
+                    if len(events) < 3:
+                        continue # Not enough data
+                        
+                    weights = {i: 0.0 for i in range(7)}
+                    last_bought_dt = None
+                    
+                    for iso in events:
+                        dt = datetime.fromisoformat(iso).astimezone(tz)
+                        if not last_bought_dt or dt > last_bought_dt:
+                            last_bought_dt = dt
+                        
+                        days_ago = (local_now - dt).days
+                        weight = 1.5 if days_ago <= 14 else 1.0 # 2-week recency bias
+                        weights[dt.weekday()] += weight
+                        
+                    # 5. Safety Net: If they bought something in the last 3 days, don't nag them
+                    if last_bought_dt and (local_now - last_bought_dt).days < 3:
+                        continue
+                        
+                    total_weight = sum(weights.values())
+                    if total_weight == 0:
+                        continue
+                        
+                    best_dow = max(weights, key=weights.get)
+                    confidence = weights[best_dow] / total_weight
+                    tomorrow_dow = (local_now.weekday() + 1) % 7
+                    
+                    # 6. If tomorrow is shopping day (>60% confidence), generate digest
+                    if best_dow == tomorrow_dow and confidence >= 0.60:
+                        pending = db.list_grocery_items(owner_id, "pending", override_hh_id=hh["id"])
+                        suggestions = db.suggest_rebuy_candidates(owner_id, limit=20, override_hh_id=hh["id"])
+                        due_items = [s for s in suggestions if s.get("is_due")]
+                        
+                        if len(pending) > 0 or len(due_items) > 0:
+                            days_map = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                            day_name = days_map[tomorrow_dow]
+                            try:
+                                # You will need to register a WhatsApp template called "grocery_digest_v1" via Meta
+                                send_template_message(
+                                    owner_id, 
+                                    "grocery_digest_v1", 
+                                    [day_name, str(len(pending)), str(len(due_items))]
+                                )
+                                db.mark_digest_sent(hh["id"])
+                                logger.info("Sent proactive weekly digest to owner=%s for hh=%s", owner_id, hh["id"])
+                            except Exception as e:
+                                logger.error("Failed to send digest to %s: %s", owner_id, e)
+            except Exception as e:
+                logger.exception("digest_loop_failed: %s", e)
+            time.sleep(3600) # Check every hour
+
+    t = threading.Thread(target=worker, name="digest-loop", daemon=True)
+    t.start()
+
+
 def _handle_message(msg: dict) -> None:
     sender = msg.get("from", "").strip()
     msg_type = msg.get("type", "")
@@ -188,19 +283,92 @@ def _handle_message(msg: dict) -> None:
                 logger.exception("rate_limit_reply_failed")
             return
 
-        if msg_type != "text":
+        if msg_type not in ("text", "audio", "image", "document"):
             try:
-                send_text_message(sender, "I can only process text messages right now.")
+                send_text_message(sender, "I can only process text, voice, image, and document messages right now.")
             except Exception:
-                logger.exception("non_text_reply_failed")
+                logger.exception("unsupported_message_type_reply_failed")
             return
 
-        text = (msg.get("text", {}) or {}).get("body", "").strip()
-        if not text:
+        text = ""
+        media_bytes = None
+        mime_type = None
+        if msg_type == "text":
+            text = (msg.get("text", {}) or {}).get("body", "").strip()
+        elif msg_type == "audio":
+            audio_id = (msg.get("audio", {}) or {}).get("id", "")
+            if not audio_id:
+                return
+            try:
+                # Download and pass directly to Gemini for free transcription
+                audio_bytes = download_media(audio_id)
+                
+                groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+                if not groq_api_key:
+                    logger.error("GROQ_API_KEY not set. Cannot transcribe audio.")
+                    send_text_message(sender, "Voice notes are currently disabled. Missing Groq API key.")
+                    return
+
+                files = {
+                    "file": ("audio.ogg", audio_bytes, "audio/ogg")
+                }
+                data = {
+                    "model": "whisper-large-v3-turbo",
+                    "response_format": "json"
+                }
+                headers = {
+                    "Authorization": f"Bearer {groq_api_key}"
+                }
+                
+                response = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                    timeout=30
+                )
+                response.raise_for_status()
+                text = response.json().get("text", "").strip()
+                
+            except Exception:
+                logger.exception("audio_transcription_failed")
+                send_text_message(sender, "Sorry, I couldn't transcribe your voice note.")
+                return
+        elif msg_type == "image":
+            img_obj = msg.get("image", {}) or {}
+            image_id = img_obj.get("id", "")
+            mime_type = img_obj.get("mime_type", "image/jpeg")
+            text = img_obj.get("caption", "").strip()
+            if not text:
+                text = "Please analyze this image."
+            if image_id:
+                try:
+                    media_bytes = download_media(image_id)
+                except Exception:
+                    logger.exception("image_download_failed")
+                    send_text_message(sender, "Sorry, I couldn't download your image.")
+                    return
+        elif msg_type == "document":
+            doc_obj = msg.get("document", {}) or {}
+            document_id = doc_obj.get("id", "")
+            mime_type = doc_obj.get("mime_type", "text/plain")
+            text = doc_obj.get("caption", "").strip()
+            if not text:
+                text = "Please analyze this document and log the expenses."
+            if document_id:
+                try:
+                    send_text_message(sender, "📄 Received your document! Analyzing it now... this might take a few seconds.")
+                    media_bytes = download_media(document_id)
+                except Exception:
+                    logger.exception("document_download_failed")
+                    send_text_message(sender, "Sorry, I couldn't download your document.")
+                    return
+
+        if not text and not media_bytes:
             return
 
         try:
-            answer = router.route(sender, text)
+            answer = router.route(sender, text, media_bytes=media_bytes, mime_type=mime_type)
         except Exception:
             logger.exception("agent_route_failed user=%s", sender)
             answer = "Something went wrong while processing your message."
@@ -220,6 +388,7 @@ def _start_background_workers() -> None:
         if workers_started:
             return
         _start_reminder_thread()
+        _start_digest_thread()
         workers_started = True
 
 
@@ -268,11 +437,11 @@ def receive_webhook() -> Response:
             logger.info("duplicate_message id=%s", msg_id)
             continue
         try:
-                executor.submit(_handle_message, msg)
-            except Exception:
+            executor.submit(_handle_message, msg)
+        except Exception:
             if msg_id:
                 _forget_processed_message(msg_id)
-                logger.exception("executor_submit_failed dropping_message id=%s", msg_id or "(none)")
+            logger.exception("executor_submit_failed dropping_message id=%s", msg_id or "(none)")
 
     # Acknowledge Meta immediately; async worker handles processing.
     return Response("ok", status=200)

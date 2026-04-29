@@ -23,7 +23,7 @@ TASK_DB = TaskDatabase()
 @lru_cache(maxsize=1)
 def _memory_store() -> MemoryStore:
     # Lazy init prevents import-time env freeze for MEMORY_BACKEND.
-    return MemoryStore(backend=os.getenv("MEMORY_BACKEND", "chroma"))
+    return MemoryStore(backend=os.getenv("MEMORY_BACKEND", "sqlite"))
 
 
 def sanitize_user_id(user_id: str) -> str:
@@ -803,16 +803,22 @@ def repeat_last_groceries(arg: str, user_id: str) -> str:
 
 def suggest_rebuy(arg: str, user_id: str) -> str:
     _ = arg
-    rows = TASK_DB.suggest_rebuy_candidates(user_id=user_id, limit=8)
+    rows = TASK_DB.suggest_rebuy_candidates(user_id=user_id, limit=15)
     if not rows:
-        return "No rebuy suggestions yet. Mark items as bought a few times first."
-    lines = ["Rebuy suggestions:"]
+        return "No consumption patterns established yet. Mark items as bought a few times first."
+    lines = ["Predicted Grocery Needs (Based on household consumption patterns):"]
     for row in rows:
         qty = _format_qty(float(row["avg_qty"]))
-        lines.append(
-            f"- {row['item_name']} ({qty} {row['unit']}, {row['category']}) "
-            f"[bought {row['times_bought']} times]"
-        )
+        if row["is_due"]:
+            lines.append(
+                f"- ⚠️ DUE: {row['item_name']} ({qty} {row['unit']}) "
+                f"-> usually bought every {row['velocity_days']} days (last bought {row['days_since_last']} days ago)."
+            )
+        else:
+            lines.append(
+                f"- {row['item_name']} ({qty} {row['unit']}) "
+                f"-> bought {row['times_bought']} times, but not due yet."
+            )
     return "\n".join(lines)
 
 
@@ -903,6 +909,63 @@ def record_store_price(arg: str, user_id: str) -> str:
     except Exception as exc:
         return f"Could not save store price: {exc}"
     return f"Saved price #{rec_id}: {_normalize_grocery_name(item_name)} at {normalized_store} = {_format_money(unit_price)}."
+
+
+def record_multiple_store_prices(arg: str, user_id: str) -> str:
+    try:
+        data = json.loads(arg)
+        if not isinstance(data, list):
+            return "Error: Expected a JSON list of price objects."
+        
+        settings = TASK_DB.get_user_settings(user_id) or {}
+        currency = settings.get("default_currency", "SGD")
+        count = 0
+        for item in data:
+            store = item.get("store")
+            name = item.get("item")
+            price = item.get("price")
+            if store and name and price is not None:
+                TASK_DB.record_store_price(
+                    user_id=user_id,
+                    item_name=name,
+                    store=store,
+                    unit_price=float(price),
+                    currency=currency,
+                    source="receipt_ocr"
+                )
+                count += 1
+        return f"Successfully recorded {count} store prices from the receipt."
+    except Exception as e:
+        return f"Failed to record multiple prices: {e}"
+
+
+def suggest_grocery_run(arg: str, user_id: str) -> str:
+    pending = TASK_DB.list_grocery_items(user_id=user_id, status="pending")
+    if not pending:
+        return "Your pending grocery list is empty. Add some items first!"
+    
+    store_totals: dict[str, float] = {}
+    items_found: dict[str, int] = {}
+    
+    for item in pending:
+        comps = TASK_DB.compare_store_prices(user_id, item["item_name"])
+        for comp in comps:
+            store = str(comp["store"]).title()
+            store_totals[store] = store_totals.get(store, 0.0) + (float(item["qty"]) * float(comp["unit_price"]))
+            items_found[store] = items_found.get(store, 0) + 1
+            
+    if not store_totals:
+        return "Not enough historical price data to optimize this basket. Try uploading more receipt photos!"
+        
+    sorted_stores = sorted(store_totals.items(), key=lambda x: x[1])
+    best_store = sorted_stores[0][0]
+    
+    lines = ["🛒 **Smart Basket Optimization** (Based on recent receipts):"]
+    for store, total in sorted_stores[:3]:
+        lines.append(f"- **{store}**: {_format_money(total)} (Found {items_found[store]}/{len(pending)} items)")
+        
+    lines.append(f"\n💡 **Recommendation:** Shop at {best_store} to optimize your savings!")
+    return "\n".join(lines)
 
 
 def compare_store_price(arg: str, user_id: str) -> str:
@@ -1218,6 +1281,8 @@ TOOLS: dict[str, Callable[[str, str], str]] = {
     "plan_meals_to_grocery": plan_meals_to_grocery,
     "record_store_price": record_store_price,
     "compare_store_price": compare_store_price,
+    "record_multiple_store_prices": record_multiple_store_prices,
+    "suggest_grocery_run": suggest_grocery_run,
     "stock_item": stock_item,
     "use_item": use_item,
     "set_stock_item": set_stock_item,
@@ -1252,10 +1317,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "set_grocery_price": "Set grocery unit price. Args: '<item_number> <price>' or '<item_number>|<price>'.",
     "grocery_budget_summary": "Show grocery estimated total using unit prices. Args: pending|bought|all.",
     "repeat_last_groceries": "Repeat recently bought groceries into pending list. Args: optional period like 7d/2w/month.",
-    "suggest_rebuy": "Suggest recurring items that are not currently pending. Args: empty string.",
+    "suggest_rebuy": "Predicts groceries needed based on household consumption velocity patterns. Args: empty string.",
     "plan_meals_to_grocery": "Convert meals into grocery items. Args: comma-separated meals (e.g. pasta, omelette).",
     "record_store_price": "Record manual store price. Args: item|store|price.",
     "compare_store_price": "Compare latest prices across stores. Args: item name.",
+    "record_multiple_store_prices": "Log multiple prices from a receipt. Args: JSON list like [{'store': 'NTUC', 'item': 'milk', 'price': 3.50}].",
+    "suggest_grocery_run": "Suggests the cheapest store for the current pending grocery list based on historical receipt prices. Args: empty string.",
     "stock_item": "Increase home inventory stock. Args: item|qty|unit or natural text.",
     "use_item": "Decrease home inventory stock. Args: item|qty|unit or natural text.",
     "set_stock_item": "Set absolute home stock level. Args: item|qty|unit or natural text.",

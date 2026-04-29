@@ -1,149 +1,194 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
-
-import google.generativeai as genai
+import time
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
 class ShoppingAgent:
     def __init__(self) -> None:
-        self.model_name = os.getenv("GEMINI_SPECIALIST_MODEL", "gemini-1.5-flash-latest")
+        self.model_name = os.getenv("GROQ_SPECIALIST_MODEL", "llama-3.3-70b-versatile")
 
     def handle(self, bundle: dict) -> dict:
-        from tools import (
-            add_grocery_item, list_grocery_items, mark_grocery_bought,
-            remove_grocery_item, clear_bought_groceries, clear_all_groceries,
-            replace_grocery_item, set_grocery_category, set_grocery_price,
-            grocery_budget_summary, repeat_last_groceries, suggest_rebuy,
-            plan_meals_to_grocery, record_store_price, compare_store_price,
-            stock_item, use_item, set_stock_item, set_inventory_threshold,
-            list_inventory, report_item_low
-        )
+        from tools import TOOLS, TOOL_DESCRIPTIONS
         user_id = bundle["user_id"]
+        user_settings = bundle.get("user_settings", {})
+        family_size = user_settings.get("family_size", 1)
 
-        # Tool wrappers to inject user_id
-        def add_item(arg: str) -> str:
-            """Add/merge grocery entry. Args: natural text or item|qty|unit|category."""
-            return add_grocery_item(arg, user_id)
+        def mark_multiple_bought(item_numbers: str) -> str:
+            """Marks multiple grocery items as bought. Args: comma-separated item numbers (e.g. '1, 3, 5')."""
+            from tools import mark_grocery_bought
+            results = []
+            for num in item_numbers.split(','):
+                if num.strip():
+                    results.append(mark_grocery_bought(num.strip(), user_id))
+            return "\n".join(results)
 
-        def list_items(arg: str = "pending grouped") -> str:
-            """List grocery entries. Args: optional status pending|bought|all and view grouped|flat."""
-            return list_grocery_items(arg, user_id)
-
-        def mark_bought(arg: str) -> str:
-            """Mark grocery item bought. Args: grocery item number from list (1-based)."""
-            return mark_grocery_bought(arg, user_id)
-
-        def remove_item(arg: str) -> str:
-            """Remove grocery item. Args: grocery item number from list (1-based)."""
-            return remove_grocery_item(arg, user_id)
-
-        def clear_bought(arg: str = "") -> str:
-            """Delete all bought groceries for current user. Args: empty string."""
-            return clear_bought_groceries(arg, user_id)
-
-        def clear_all(arg: str = "") -> str:
-            """Delete all groceries for current user. Args: empty string."""
-            return clear_all_groceries(arg, user_id)
-
-        def replace_item(arg: str) -> str:
-            """Replace a pending grocery item. Args: new_item|old_item."""
-            return replace_grocery_item(arg, user_id)
-
-        def set_category(arg: str) -> str:
-            """Set grocery category. Args: '<item_number> <category>' or '<item_number>|<category>'."""
-            return set_grocery_category(arg, user_id)
-
-        def set_price(arg: str) -> str:
-            """Set grocery unit price. Args: '<item_number> <price>' or '<item_number>|<price>'."""
-            return set_grocery_price(arg, user_id)
-
-        def budget_summary(arg: str = "pending") -> str:
-            """Show grocery estimated total using unit prices. Args: pending|bought|all."""
-            return grocery_budget_summary(arg, user_id)
-
-        def repeat_groceries(arg: str = "7d") -> str:
-            """Repeat recently bought groceries into pending list. Args: optional period like 7d/2w/month."""
-            return repeat_last_groceries(arg, user_id)
-
-        def suggest_items(arg: str = "") -> str:
-            """Suggest recurring items that are not currently pending. Args: empty string."""
-            return suggest_rebuy(arg, user_id)
-
-        def plan_meals(arg: str) -> str:
-            """Convert meals into grocery items. Args: comma-separated meals (e.g. pasta, omelette)."""
-            return plan_meals_to_grocery(arg, user_id)
-
-        def record_price(arg: str) -> str:
-            """Record manual store price. Args: item|store|price."""
-            return record_store_price(arg, user_id)
-
-        def compare_price(arg: str) -> str:
-            """Compare latest prices across stores. Args: item name."""
-            return compare_store_price(arg, user_id)
-
-        # Inventory tools
-        def add_to_stock(arg: str) -> str:
-            """Increase home inventory stock. Args: item|qty|unit or natural text."""
-            return stock_item(arg, user_id)
-
-        def use_from_stock(arg: str) -> str:
-            """Decrease home inventory stock. Args: item|qty|unit or natural text."""
-            return use_item(arg, user_id)
-
-        def set_stock_level(arg: str) -> str:
-            """Set absolute home stock level. Args: item|qty|unit or natural text."""
-            return set_stock_item(arg, user_id)
-
-        def set_low_stock_threshold(arg: str) -> str:
-            """Set low-stock threshold. Args: item|qty|unit or natural text."""
-            return set_inventory_threshold(arg, user_id)
-
-        def list_stock(arg: str = "") -> str:
-            """List inventory items. Args: optional 'low'."""
-            return list_inventory(arg, user_id)
-
-        def report_low(arg: str) -> str:
-            """Mark item as low and add refill to grocery list. Args: item name."""
-            return report_item_low(arg, user_id)
-
-        tools_list = [
-            add_item, list_items, mark_bought, remove_item, clear_bought, clear_all,
-            replace_item, set_category, set_price, budget_summary, repeat_groceries,
-            suggest_items, plan_meals, record_price, compare_price, add_to_stock,
-            use_from_stock, set_stock_level, set_low_stock_threshold, list_stock, report_low
+        allowed = [
+            "add_grocery_item", "list_grocery_items", "mark_grocery_bought",
+            "remove_grocery_item", "clear_bought_groceries", "clear_all_groceries",
+            "replace_grocery_item", "set_grocery_category", "set_grocery_price",
+            "grocery_budget_summary", "repeat_last_groceries", "suggest_rebuy",
+            "plan_meals_to_grocery", "record_store_price", "compare_store_price",
+            "stock_item", "use_item", "set_stock_item", "set_inventory_threshold",
+            "list_inventory", "report_item_low", "record_multiple_store_prices",
+            "suggest_grocery_run", "mark_multiple_bought"
         ]
 
-        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-        if api_key:
-            genai.configure(api_key=api_key)
+        local_tools = {}
+        local_desc = dict(TOOL_DESCRIPTIONS)
+        local_desc["mark_multiple_bought"] = "Marks multiple grocery items as bought. Args: comma-separated item numbers (e.g. '1, 3, 5')."
 
-        model = genai.GenerativeModel(
-            model_name=self.model_name,
-            tools=tools_list,
-            system_instruction=(
-                "You are the Shopping Specialist. You handle groceries, home inventory, and store prices.\n"
-                "Use the provided tools to fulfill the user's request.\n"
-                "Always reply with a single, terse sentence starting with a relevant emoji."
-            )
+        for name in allowed:
+            if name == "mark_multiple_bought":
+                local_tools[name] = lambda arg="", uid=user_id: mark_multiple_bought(arg)
+            else:
+                func = TOOLS.get(name)
+                if func:
+                    local_tools[name] = (lambda f, uid=user_id: lambda arg="": f(arg, uid))(func)
+
+        openai_tools = []
+        for name in local_tools.keys():
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": local_desc.get(name, "Tool function"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"arg": {"type": "string", "description": "The argument string for the tool."}},
+                        "required": ["arg"] if name not in ["suggest_rebuy"] else []
+                    }
+                }
+            })
+
+        system_instruction = (
+            "You are the Shopping Specialist. You handle groceries, home inventory, and store prices.\n"
+            f"Context: The user's household has {family_size} members. Use this to estimate how long items will last or suggest extra quantities if guests are coming.\n"
+            "Use the provided tools to fulfill the user's request.\n"
+            "If the user asks what they need or what to buy, use `suggest_rebuy` to predict their needs based on household consumption velocity.\n"
+            "If the user asks to optimize their grocery run or find the cheapest store, use `suggest_grocery_run`.\n"
+            "If the user uploads a grocery receipt (bill):\n"
+            "1. Identify the store name, purchased items, and their individual prices from the image.\n"
+            "2. Use `mark_multiple_bought` to mark the items you found on the receipt as bought.\n"
+            "4. Use `record_multiple_store_prices` passing a JSON list (e.g. `[{\"store\": \"Fairprice\", \"item\": \"Milk\", \"price\": 3.50}]`) to log the prices.\n"
+            "5. Use `stock_item` to update home inventory if applicable.\n" 
+            "Visible Context Cues: Always explicitly echo the scope/household you used in your final reply to catch misroutes (e.g., '✅ Added milk to **Home** groceries').\n"
+            "Always reply in the same language the user wrote in (English, Hindi, Hinglish, etc.). Mirror their language exactly. Item names from the database may be in any language; preserve them as stored."
         )
 
-        chat = model.start_chat(enable_automatic_function_calling=True)
         user_msg = bundle.get("subrequest") or bundle.get("original_message")
-        prompt = f"Request: {user_msg}"
+        messages = [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": f"Request: {user_msg}"}
+        ]
 
-        try:
-            response = chat.send_message(prompt)
-            text = ""
+        if bundle.get("media_bytes") and bundle.get("mime_type"):
+            return self._fallback_gemini(bundle, allowed, local_tools, local_desc, system_instruction)
+
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            logger.error("GROQ_API_KEY not set.")
+            return {"kind": "reply", "text": "Missing Groq API key."}
+            
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+
+        for attempt in range(5):
             try:
-                text = response.text.strip()
-            except ValueError:
-                text = "✅ Shopping task executed."
-            if not text:
-                text = "✅ Shopping task completed."
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    tools=openai_tools,
+                    tool_choice="auto"
+                )
+                
+                msg = response.choices[0].message
+                if msg.tool_calls:
+                    messages.append(msg.model_dump(exclude_unset=True))
+                    for tc in msg.tool_calls:
+                        func_name = tc.function.name
+                        try:
+                            args = json.loads(tc.function.arguments)
+                            arg_val = args.get("arg", "")
+                        except Exception:
+                            arg_val = ""
+                        
+                        try:
+                            obs = local_tools[func_name](arg_val)
+                        except Exception as e:
+                            obs = f"Error: {e}"
+                            
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": str(obs)
+                        })
+                else:
+                    from tool_fallback import absorb_leaked_calls
+                    # Shopping passes a single positional `arg` string to each tool;
+                    # adapt the leak handler with a thin wrapper.
+                    def _shop_tool(name):
+                        def _call(**kw):
+                            arg = kw.get("arg") or kw.get("query") or ""
+                            if not arg and kw:
+                                # Fall back to first JSON-string value
+                                for v in kw.values():
+                                    if isinstance(v, str):
+                                        arg = v
+                                        break
+                            return local_tools[name](arg)
+                        return _call
+                    wrapped = {n: _shop_tool(n) for n in local_tools.keys()}
+                    if absorb_leaked_calls(messages, msg.content or "", wrapped):
+                        continue
+                    text = msg.content.strip() if msg.content else "✅ Shopping task executed."
+                    return {"kind": "reply", "text": text}
+            except Exception as e:
+                if attempt == 0 and ("429" in str(e) or "ResourceExhausted" in str(e)):
+                    import re, time
+                    m = re.search(r"retry in (\d+)", str(e))
+                    wait_sec = int(m.group(1)) + 2 if m else 10
+                    logger.warning("ShoppingAgent rate limit hit. Waiting %d seconds...", wait_sec)
+                    time.sleep(wait_sec)
+                else:
+                    logger.error("ShoppingAgent error: %s", e)
+                    return {"kind": "reply", "text": "Sorry, I couldn't process your shopping request right now."}
+        return {"kind": "reply", "text": "✅ Shopping task completed."}
+
+    def _fallback_gemini(self, bundle, allowed, local_tools, local_desc, system_instruction):
+        import google.generativeai as genai
+        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+        genai.configure(api_key=api_key)
+        
+        gemini_tools = []
+        for name in allowed:
+            if name in local_tools:
+                def make_wrapper(n):
+                    def wrapper(arg: str = "") -> str:
+                        return local_tools[n](arg)
+                    wrapper.__name__ = n
+                    wrapper.__doc__ = local_desc.get(n, "Executes tool")
+                    return wrapper
+                gemini_tools.append(make_wrapper(name))
+                
+        model = genai.GenerativeModel(
+            model_name=os.getenv("GEMINI_SPECIALIST_MODEL", "gemini-2.5-flash"),
+            tools=gemini_tools,
+            system_instruction=system_instruction
+        )
+        chat = model.start_chat(enable_automatic_function_calling=True)
+        prompt = bundle.get("subrequest") or bundle.get("original_message")
+        contents = [prompt]
+        if bundle.get("media_bytes") and bundle.get("mime_type"):
+            contents.append({"mime_type": bundle.get("mime_type"), "data": bundle.get("media_bytes")})
+        
+        try:
+            response = chat.send_message(contents)
+            text = response.text.strip() if response.text else "✅ Image processed."
             return {"kind": "reply", "text": text}
         except Exception as e:
-            logger.error("ShoppingAgent error: %s", e)
-            return {"kind": "reply", "text": "Sorry, I couldn't process your shopping request right now."}
+            logger.error("Gemini fallback error: %s", e)
+            return {"kind": "reply", "text": "Sorry, I couldn't process your image right now."}

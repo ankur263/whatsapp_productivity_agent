@@ -1,0 +1,16 @@
+app = "whatsapp-productivity-agent"
+primary_region = "sin" # Singapore (change if you prefer another region like 'iad')
+
+[build]
+  dockerfile = "Dockerfile"
+
+[mounts]
+  source = "whatsapp_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1

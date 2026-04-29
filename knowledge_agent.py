@@ -6,85 +6,60 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-class EventsAgent:
+class KnowledgeAgent:
     def __init__(self) -> None:
         self.model_name = os.getenv("GROQ_SPECIALIST_MODEL", "llama-3.3-70b-versatile")
         
     def handle(self, bundle: dict) -> dict:
-        user_id = bundle["user_id"]
+        from tools import web_search, calculate, wikipedia_summary, get_current_time
         
-        def add_event(title: str, event_date: str, recurrence: str = "", remind_lead_days: int = 1) -> str:
-            from database import TaskDatabase
-            db = TaskDatabase()
-            eid = db.add_event(user_id, title, event_date, recurrence or None, remind_lead_days)
-            return f"Event '{title}' added with ID {eid}."
-            
-        def list_events() -> str:
-            from database import TaskDatabase
-            db = TaskDatabase()
-            events = db.list_events(user_id)
-            if not events:
-                return "No events found."
-            lines = []
-            for e in events:
-                lines.append(f"{e['id']}: {e['title']} on {e['event_date']} (recur: {e['recurrence']})")
-            return "Events:\n" + "\n".join(lines)
-
-        def delete_event(event_id: int) -> str:
-            from database import TaskDatabase
-            db = TaskDatabase()
-            ok = db.delete_event(user_id, event_id)
-            return "Event deleted." if ok else "Event not found."
-            
         local_tools = {
-            "add_event": add_event,
-            "list_events": list_events,
-            "delete_event": delete_event
+            "web_search": lambda query: web_search(query),
+            "calculate": lambda expression: calculate(expression),
+            "wikipedia_summary": lambda topic: wikipedia_summary(topic),
+            "get_current_time": lambda: get_current_time()
         }
 
         openai_tools = [
             {
                 "type": "function",
                 "function": {
-                    "name": "add_event",
-                    "description": "Adds a life event. event_date must be YYYY-MM-DD. recurrence can be 'yearly', 'monthly', or empty.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "event_date": {"type": "string"},
-                            "recurrence": {"type": "string"},
-                            "remind_lead_days": {"type": "integer"}
-                        },
-                        "required": ["title", "event_date"]
-                    }
+                    "name": "web_search",
+                    "description": "Searches the web for current information.",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 }
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "list_events",
-                    "description": "Lists all life events.",
+                    "name": "calculate",
+                    "description": "Evaluates a mathematical expression safely.",
+                    "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "wikipedia_summary",
+                    "description": "Gets a summary of a topic from Wikipedia.",
+                    "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Gets the current local date and time.",
                     "parameters": {"type": "object", "properties": {}, "required": []}
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "delete_event",
-                    "description": "Deletes an event.",
-                    "parameters": {"type": "object", "properties": {"event_id": {"type": "integer"}}, "required": ["event_id"]}
                 }
             }
         ]
 
         system_instruction = (
-            "You are the Events Specialist. You manage birthdays, anniversaries, and recurring life events.\n"
-            "Use tools to add, list, or delete events. Event dates MUST be YYYY-MM-DD.\n"
-            f"Today's date is {bundle.get('now_local_iso', 'unknown')}.\n"
-            "Always reply with a single, terse sentence starting with a relevant emoji.\n"
-            "Visible Context Cues: Always explicitly echo the scope/household you used in your final reply to catch misroutes.\n"
-            "Mirror the user's language exactly."
+            "You are the Knowledge Specialist. You handle factual questions, math, web searches, and general inquiries.\n"
+            "Use the provided tools to fulfill the user's request. If they ask about recent events or facts you don't know, use web_search or wikipedia_summary.\n"
+            "Always reply with a single, terse, helpful sentence starting with a relevant emoji.\n"
+            "Always reply in the same language the user wrote in (English, Hindi, Hinglish, etc.). Mirror their language exactly."
         )
         
         user_msg = bundle.get("subrequest") or bundle.get("original_message")
@@ -129,7 +104,7 @@ class EventsAgent:
                     from tool_fallback import absorb_leaked_calls
                     if absorb_leaked_calls(messages, msg.content or "", local_tools):
                         continue
-                    text = msg.content.strip() if msg.content else "✅ Events task executed."
+                    text = msg.content.strip() if msg.content else "✅ Knowledge task executed."
                     return {"kind": "reply", "text": text}
             except Exception as e:
                 if attempt == 0 and "429" in str(e):
@@ -138,9 +113,9 @@ class EventsAgent:
                     wait_sec = int(m.group(1)) + 2 if m else 10
                     time.sleep(wait_sec)
                 else:
-                    logger.error("EventsAgent error: %s", e)
-                    return {"kind": "reply", "text": "Sorry, I couldn't process your events request right now."}
-        return {"kind": "reply", "text": "✅ Events task completed."}
+                    logger.error("KnowledgeAgent error: %s", e)
+                    return {"kind": "reply", "text": "Sorry, I couldn't process your question right now."}
+        return {"kind": "reply", "text": "✅ Knowledge task completed."}
 
     def _fallback_gemini(self, bundle, local_tools, system_instruction):
         import google.generativeai as genai

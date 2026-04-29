@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home OS | Private WhatsApp Assistant</title>
+    <meta name="description" content="Your private AI assistant on WhatsApp for tasks, finance, groceries, and journaling.">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f4f4f5;
+            margin: 0;
+            padding: 2rem 1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: white;
+            padding: 2.5rem 2rem;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.05);
+            text-align: center;
+            max-width: 450px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        h1 {
+            margin-top: 0;
+            color: #111;
+            font-size: 2rem;
+        }
+        .subtitle {
+            color: #555;
+            font-size: 1.1rem;
+            margin-bottom: 2rem;
+        }
+        .features {
+            text-align: left;
+            margin: 0 auto 2rem auto;
+            max-width: max-content;
+            padding-left: 0;
+            list-style: none;
+        }
+        .features li {
+            margin-bottom: 0.8rem;
+            font-size: 1.05rem;
+        }
+        .cta-button {
+            display: inline-block;
+            background-color: #25D366;
+            color: white;
+            text-decoration: none;
+            padding: 1rem 2rem;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 1.1rem;
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        .cta-button:hover { background-color: #128C7E; }
+        .cta-button:active { transform: scale(0.98); }
+        .footer {
+            margin-top: 2rem;
+            font-size: 0.85rem;
+            color: #777;
+        }
+        .footer a {
+            color: #777;
+            text-decoration: none;
+            margin: 0 0.5rem;
+        }
+        .footer a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏠 Home OS</h1>
+        <p class="subtitle">Your private WhatsApp assistant.</p>
+        
+        <ul class="features">
+            <li>✅ Reminders & tasks</li>
+            <li>✅ Personal finance</li>
+            <li>✅ Groceries & shopping</li>
+            <li>✅ Journal & notes</li>
+        </ul>
+
+        <p style="font-size: 0.95rem; color: #666; margin-bottom: 1.5rem;">
+            Free to start. Works solo or with family. No app to install.
+        </p>
+
+        <!-- ⚠️ REPLACE '1234567890' WITH YOUR ACTUAL WHATSAPP NUMBER (Include country code, no '+') -->
+        <a href="https://api.whatsapp.com/send/?phone=19342390745&text=hi" class="cta-button" target="_blank">
+            💬 Start on WhatsApp
+        </a>
+    </div>
+
+    <div class="footer">
+        <a href="privacy.html">Privacy</a> &middot; 
+        <a href="terms.html">Terms</a> &middot; 
+        <a href="mailto:support@yourdomain.com">Support</a>
+    </div>
+</body>
+</html>

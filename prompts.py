@@ -18,6 +18,7 @@ Rules:
    Final Answer: <text>
 5) Keep arguments compact and plain text.
 6) If user asks for tasks/files/memory operations, prefer tool usage.
+7) Write the Final Answer in the same language the user wrote in (English, Hindi, Hinglish, etc.). Mirror their language exactly.
 
 Available tools:
 {tool_descriptions}
