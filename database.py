@@ -383,7 +383,7 @@ class TaskDatabase:
             row["name"]
             for row in conn.execute("PRAGMA table_info(user_settings)").fetchall()
         }
-        for col in ["timezone", "locale", "quiet_hours_start", "quiet_hours_end", "onboarding_state", "family_size"]:
+        for col in ["timezone", "locale", "quiet_hours_start", "quiet_hours_end", "onboarding_state", "family_size", "household_profile"]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE user_settings ADD COLUMN {col} TEXT")
 
@@ -422,6 +422,8 @@ class TaskDatabase:
                 )
                 WHERE family_size IS NULL
             """)
+        if "household_profile" not in hh_cols:
+            c.execute("ALTER TABLE households ADD COLUMN household_profile TEXT")
             
         c.execute("""
             CREATE TABLE IF NOT EXISTS household_members (
@@ -591,16 +593,19 @@ class TaskDatabase:
         hh_id = "hh_" + uuid.uuid4().hex[:8]
         now = _utc_now_iso()
         with self._conn() as c:
-            row = c.execute("SELECT family_size FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+            row = c.execute("SELECT family_size, household_profile FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
             family_size = None
+            household_profile = None
             if row and row["family_size"]:
                 try:
                     family_size = int(row["family_size"])
                 except (TypeError, ValueError):
                     family_size = None
+            if row and row["household_profile"]:
+                household_profile = row["household_profile"]
             c.execute(
-                "INSERT INTO households(id, name, created_at, created_by, family_size) VALUES (?, ?, ?, ?, ?)",
-                (hh_id, name, now, user_id, family_size),
+                "INSERT INTO households(id, name, created_at, created_by, family_size, household_profile) VALUES (?, ?, ?, ?, ?, ?)",
+                (hh_id, name, now, user_id, family_size, household_profile),
             )
             c.execute("INSERT INTO household_members(household_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)", (hh_id, user_id, now))
             c.execute(
@@ -623,6 +628,18 @@ class TaskDatabase:
         with self._conn() as c:
             c.execute("UPDATE households SET family_size = ? WHERE id = ?", (int(size), household_id))
 
+    def get_household_profile(self, household_id: str) -> str | None:
+        with self._conn() as c:
+            row = c.execute("SELECT household_profile FROM households WHERE id = ?", (household_id,)).fetchone()
+        return row["household_profile"] if row and row["household_profile"] else None
+
+    def set_household_profile(self, household_id: str, profile_json: str, family_size: int) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE households SET household_profile = ?, family_size = ? WHERE id = ?",
+                (profile_json, int(family_size), household_id),
+            )
+
     def get_user_households(self, user_id: str) -> list[dict]:
         with self._conn() as c:
             rows = c.execute("SELECT h.id, h.name, m.role FROM households h JOIN household_members m ON h.id = m.household_id WHERE m.user_id = ?", (user_id,)).fetchall()
@@ -638,6 +655,11 @@ class TaskDatabase:
             row = c.execute("SELECT user_id FROM household_members WHERE household_id = ? AND role = 'owner' LIMIT 1", (household_id,)).fetchone()
         return row["user_id"] if row else None
 
+    def get_household_owner_count(self, household_id: str) -> int:
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) AS count FROM household_members WHERE household_id = ? AND role = 'owner'", (household_id,)).fetchone()
+        return int(row["count"]) if row else 0
+
     def get_recent_bought_events(self, household_id: str, days: int = 60) -> list[str]:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         with self._conn() as c:
@@ -650,6 +672,17 @@ class TaskDatabase:
 
     def leave_household(self, user_id: str, household_id: str) -> bool:
         with self._conn() as c:
+            membership = c.execute(
+                "SELECT role FROM household_members WHERE household_id = ? AND user_id = ?",
+                (household_id, user_id),
+            ).fetchone()
+            if membership and membership["role"] == "owner":
+                owners = c.execute(
+                    "SELECT COUNT(*) AS count FROM household_members WHERE household_id = ? AND role = 'owner'",
+                    (household_id,),
+                ).fetchone()
+                if owners and int(owners["count"]) <= 1:
+                    return False
             cur = c.execute("DELETE FROM household_members WHERE household_id = ? AND user_id = ?", (household_id, user_id))
             if cur.rowcount > 0:
                 row = c.execute("SELECT active_household_id FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
@@ -1552,6 +1585,7 @@ class TaskDatabase:
                 "quiet_hours_end",
                 "onboarding_state",
                 "family_size",
+                "household_profile",
                 "is_allowed",
                 "active_household_id"
             }

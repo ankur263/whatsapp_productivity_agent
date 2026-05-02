@@ -17,6 +17,7 @@ class ShoppingAgent:
         user_id = bundle["user_id"]
         user_settings = bundle.get("user_settings", {})
         family_size = bundle.get("family_size") or user_settings.get("family_size", 1)
+        household_profile_summary = bundle.get("household_profile_summary") or f"{family_size} people"
 
         def mark_multiple_bought(item_numbers: str) -> str:
             """Marks multiple grocery items as bought. Args: comma-separated item numbers (e.g. '1, 3, 5')."""
@@ -67,7 +68,7 @@ class ShoppingAgent:
 
         system_instruction = (
             "You are the Shopping Specialist. You handle groceries, home inventory, and store prices.\n"
-            f"Context: The user's household has {family_size} members. Use this to estimate how long items will last or suggest extra quantities if guests are coming.\n"
+            f"Context: The user's household profile is {household_profile_summary} ({family_size} total). Use adults, children, and babies differently when estimating quantities; babies may imply baby food, diapers, wipes, or formula instead of adult-sized food portions.\n"
             "Use the provided tools to fulfill the user's request.\n"
             "If the user asks what they need or what to buy, use `suggest_rebuy` to predict their needs based on household consumption velocity.\n"
             "If the user asks to optimize their grocery run or find the cheapest store, use `suggest_grocery_run`.\n"

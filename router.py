@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+import json
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Dict
@@ -118,6 +119,10 @@ class AgentRouter:
 
         # Intercept the first real action to set up a workspace
         if settings and settings.get("onboarding_state") == "await_first_action":
+            profile_reply = self._maybe_handle_household_profile_update(user_id, text, settings)
+            if profile_reply:
+                return profile_reply
+
             clean_text_for_greeting = re.sub(r"[^\w\s]", "", text.strip().lower())
             is_greeting = clean_text_for_greeting in ["hi", "hello", "hey", "help", "test", "ping"]
             
@@ -179,6 +184,8 @@ class AgentRouter:
                 idx = int(parts[1].strip()) - 1
                 if idx < 0: raise ValueError()
                 target = hhs[idx]
+                if target["role"] == "owner" and self.db.get_household_owner_count(target["id"]) <= 1:
+                    return "❌ You cannot leave this household because you are the last owner."
                 self.db.leave_household(user_id, target["id"])
                 return f"✅ You have left *{target['name']}*."
             except Exception:
@@ -199,6 +206,11 @@ class AgentRouter:
         free_limit = int(os.getenv("FREE_MESSAGE_LIMIT", "200"))
         if self.db.get_monthly_message_count(user_id) >= free_limit:
             return f"⚠️ *Quota Exceeded*\n\nYou've reached your free limit of {free_limit} messages for this month. Please wait until the 1st of next month."
+
+        if settings and settings.get("onboarding_state") == "complete":
+            profile_reply = self._maybe_handle_household_profile_update(user_id, text, settings)
+            if profile_reply:
+                return profile_reply
 
         # 2. Onboarding State Machine
         if not settings or settings.get("onboarding_state") != "complete":
@@ -276,6 +288,8 @@ class AgentRouter:
                     "original_message": text,
                     "user_settings": settings or {},
                     "family_size": self._effective_family_size(settings),
+                    "household_profile": self._effective_household_profile(settings),
+                    "household_profile_summary": self._format_household_profile(self._effective_household_profile(settings)),
                     "recent_turns": recent_turns,
                     "now_local_iso": datetime.now(timezone.utc).isoformat(),
                     "media_bytes": media_bytes,
@@ -367,17 +381,223 @@ class AgentRouter:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
+    def _profile_total(self, profile: dict | None) -> int:
+        if not profile:
+            return 0
+        return sum(max(0, int(profile.get(k) or 0)) for k in ["adults", "children", "babies", "people"])
+
+    def _normalize_household_profile(self, profile: dict | None) -> dict:
+        base = {"adults": 0, "children": 0, "babies": 0, "people": 0}
+        if profile:
+            for key in base:
+                try:
+                    base[key] = max(0, int(profile.get(key) or 0))
+                except (TypeError, ValueError):
+                    base[key] = 0
+        return base
+
+    def _load_profile_json(self, raw: str | None) -> dict | None:
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        profile = self._normalize_household_profile(parsed)
+        return profile if self._profile_total(profile) else None
+
+    def _profile_from_family_size(self, raw: str | int | None) -> dict | None:
+        try:
+            size = int(raw) if raw is not None and str(raw).strip() else 0
+        except (TypeError, ValueError):
+            size = 0
+        if size < 1:
+            return None
+        return {"adults": 0, "children": 0, "babies": 0, "people": size}
+
+    def _effective_household_profile(self, settings: dict | None) -> dict:
+        settings = settings or {}
+        hh_id = settings.get("active_household_id")
+        if hh_id:
+            hh_profile = self._load_profile_json(self.db.get_household_profile(hh_id))
+            if hh_profile:
+                return hh_profile
+            hh_size = self.db.get_household_family_size(hh_id)
+            from_size = self._profile_from_family_size(hh_size)
+            if from_size:
+                return from_size
+        user_profile = self._load_profile_json(settings.get("household_profile"))
+        if user_profile:
+            return user_profile
+        return self._profile_from_family_size(settings.get("family_size")) or {"adults": 0, "children": 0, "babies": 0, "people": 1}
+
     def _effective_family_size(self, settings: dict | None) -> int:
+        return self._profile_total(self._effective_household_profile(settings)) or 1
+
+    def _format_household_profile(self, profile: dict | None) -> str:
+        profile = self._normalize_household_profile(profile)
+        parts = []
+        labels = [
+            ("adults", "adult", "adults"),
+            ("children", "child", "children"),
+            ("babies", "baby", "babies"),
+            ("people", "person", "people"),
+        ]
+        for key, singular, plural in labels:
+            count = profile.get(key, 0)
+            if count:
+                parts.append(f"{count} {singular if count == 1 else plural}")
+        return " + ".join(parts) if parts else "1 person"
+
+    def _save_household_profile(self, user_id: str, settings: dict | None, profile: dict) -> dict:
+        profile = self._normalize_household_profile(profile)
+        total = self._profile_total(profile)
+        if total < 1:
+            raise ValueError("Household profile must include at least one person.")
+        profile_json = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+        self.db.upsert_user_setting(user_id, "family_size", str(total))
+        self.db.upsert_user_setting(user_id, "household_profile", profile_json)
         hh_id = (settings or {}).get("active_household_id")
         if hh_id:
-            size = self.db.get_household_family_size(hh_id)
-            if size:
-                return size
-        raw = (settings or {}).get("family_size")
-        try:
-            return int(raw) if raw else 1
-        except (TypeError, ValueError):
-            return 1
+            self.db.set_household_profile(hh_id, profile_json, total)
+        if settings is not None:
+            settings["family_size"] = str(total)
+            settings["household_profile"] = profile_json
+        return profile
+
+    def _parse_household_profile_text(self, text: str, current_profile: dict | None = None, default_operation: str = "replace") -> dict:
+        original = (text or "").strip()
+        lowered = original.lower()
+        if not lowered:
+            return {"ok": False, "reason": "empty"}
+
+        word_map = {
+            "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+            "ek": "1", "do": "2", "teen": "3", "char": "4", "chaar": "4",
+            "paanch": "5", "panch": "5", "che": "6", "chah": "6", "saat": "7",
+            "aath": "8", "nau": "9", "das": "10", "एक": "1", "दो": "2", "तीन": "3", "चार": "4"
+        }
+        normalized = lowered.replace("&", " and ")
+        normalized = re.sub(r"[^\w\s]", " ", normalized, flags=re.UNICODE)
+        normalized = re.sub(r"\b(a|an)\b", "1", normalized)
+        for word, digit in word_map.items():
+            normalized = re.sub(rf"\b{re.escape(word)}\b", digit, normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        replace_markers = [
+            "actually", "correction", "instead", "make it", "change to", "set to",
+            "we are", "we re", "total", "overall", "only"
+        ]
+        add_markers = [
+            "add", "also", "plus", "include", "including", "another", "more", "extra", "along with"
+        ]
+        starts_additive = re.match(r"^(and|plus|also|add)\b", normalized) is not None
+        operation = default_operation
+        if any(marker in normalized for marker in replace_markers):
+            operation = "replace"
+        elif starts_additive or any(marker in normalized for marker in add_markers):
+            operation = "add"
+
+        profile = {"adults": 0, "children": 0, "babies": 0, "people": 0}
+        category_patterns = [
+            ("babies", r"babies|baby|infants?|newborns?"),
+            ("children", r"children|child|kids?|toddlers?"),
+            ("adults", r"adults?|grownups?|grown ups?"),
+            ("people", r"people|persons?|members?|family members?"),
+        ]
+
+        for key, pattern in category_patterns:
+            combined = rf"(?:\b(?P<count1>\d{{1,2}})\s+(?P<cat1>{pattern})\b|\b(?P<cat2>{pattern})\s+(?P<count2>\d{{1,2}})\b)"
+            for match in re.finditer(combined, normalized):
+                count = match.group("count1") or match.group("count2")
+                if count is not None:
+                    value = int(count)
+                    if value <= 50:
+                        profile[key] += value
+
+        relation_terms = [
+            "wife", "husband", "spouse", "partner", "mom", "mother", "mum", "dad", "father",
+            "parent", "grandma", "grandmother", "grandpa", "grandfather"
+        ]
+        relation_count = sum(1 for term in relation_terms if re.search(rf"\b{term}\b", normalized))
+        relation_context = (
+            default_operation == "replace"
+            or any(marker in normalized for marker in ["household", "family", "also", "plus", "include", "including", "along with"])
+            or starts_additive
+        )
+        if relation_count and relation_context:
+            profile["adults"] += relation_count
+            if re.search(r"\b(me|myself)\b", normalized):
+                profile["adults"] += 1
+            elif not re.search(r"\b(i am|i m|we are|we re)\b", normalized):
+                profile["adults"] += 1
+            if not profile["babies"] and re.search(r"\b(baby|infant|newborn)\b", normalized):
+                profile["babies"] += 1
+            if not profile["children"] and re.search(r"\b(child|kid|toddler)\b", normalized):
+                profile["children"] += 1
+
+        mentioned_category_without_count = False
+        if not self._profile_total(profile):
+            for key, pattern in category_patterns:
+                if re.search(rf"\b(?:{pattern})\b", normalized):
+                    mentioned_category_without_count = True
+                    bare_addition = re.fullmatch(
+                        rf"(?:and\s+|plus\s+|also\s+|add\s+)?(?:{pattern})(?:\s+also)?",
+                        normalized,
+                    )
+                    if operation == "add" and key != "people" and bare_addition:
+                        profile[key] += 1
+                    break
+
+        if not self._profile_total(profile):
+            number_tokens = [int(n) for n in re.findall(r"\b\d{1,2}\b", normalized) if int(n) <= 50]
+            has_household_context = any(
+                marker in normalized
+                for marker in ["household", "family", "people", "person", "member", "we are", "we re", "make it", "total"]
+            )
+            if len(number_tokens) == 1 and (default_operation == "replace" or has_household_context):
+                profile["people"] = number_tokens[0]
+
+        if self._profile_total(profile) < 1:
+            return {"ok": False, "reason": "ambiguous" if mentioned_category_without_count else "no_profile"}
+
+        if operation == "add":
+            current = self._normalize_household_profile(current_profile)
+            addition_has_specific_people = any(profile[k] for k in ["adults", "children", "babies"])
+            if current.get("people") and addition_has_specific_people:
+                current["adults"] += current["people"]
+                current["people"] = 0
+            for key, value in profile.items():
+                current[key] += value
+            profile = current
+
+        return {"ok": True, "operation": operation, "profile": self._normalize_household_profile(profile)}
+
+    def _maybe_handle_household_profile_update(self, user_id: str, text: str, settings: dict | None) -> str | None:
+        if (text or "").lstrip().startswith("/"):
+            return None
+
+        parsed = self._parse_household_profile_text(
+            text,
+            current_profile=self._effective_household_profile(settings),
+            default_operation="add",
+        )
+        if not parsed.get("ok"):
+            return None
+
+        canonical = self._canonical_text(text)
+        profile_words = {
+            "adult", "adults", "child", "children", "kid", "kids", "baby", "babies",
+            "infant", "newborn", "people", "person", "members", "family", "household",
+            "wife", "husband", "spouse", "partner", "mom", "mother", "dad", "father",
+            "actually", "also", "plus", "include", "including", "make it", "we are"
+        }
+        if not any(word in canonical for word in profile_words):
+            return None
+
+        profile = self._save_household_profile(user_id, settings, parsed["profile"])
+        return f"✅ Household updated: *{self._format_household_profile(profile)}*. I'll use this for grocery estimates."
 
     def _inherit_household_profile(self, user_id: str, household_id: str) -> dict | None:
         owner_id = self.db.get_household_owner(household_id)
@@ -392,6 +612,8 @@ class AgentRouter:
         self.db.upsert_user_setting(user_id, "timezone", tz)
         if owner.get("family_size"):
             self.db.upsert_user_setting(user_id, "family_size", owner["family_size"])
+        if owner.get("household_profile"):
+            self.db.upsert_user_setting(user_id, "household_profile", owner["household_profile"])
         if owner.get("locale"):
             self.db.upsert_user_setting(user_id, "locale", owner["locale"])
         return {"default_currency": currency, "timezone": tz}
@@ -401,19 +623,22 @@ class AgentRouter:
         settings = self.db.get_user_settings(user_id) or {}
         currency = settings.get("default_currency") or "—"
         tz = settings.get("timezone") or "—"
+        household = self._format_household_profile(self._effective_household_profile(settings))
 
         if len(parts) == 1:
             return (
                 "⚙️ *Your settings*\n"
                 f"• Currency: *{currency}*\n"
-                f"• Timezone: *{tz}*\n\n"
+                f"• Timezone: *{tz}*\n"
+                f"• Household: *{household}*\n\n"
                 "To change:\n"
                 "• `/settings currency USD`\n"
-                "• `/settings timezone Asia/Kolkata`"
+                "• `/settings timezone Asia/Kolkata`\n"
+                "• `/settings household 3 adults 1 baby`"
             )
 
         if len(parts) < 3:
-            return "❌ Usage: `/settings currency USD` or `/settings timezone Asia/Kolkata`"
+            return "❌ Usage: `/settings currency USD`, `/settings timezone Asia/Kolkata`, or `/settings household 3 adults 1 baby`"
 
         key, value = parts[1].lower(), parts[2].strip()
         if key == "currency":
@@ -430,7 +655,17 @@ class AgentRouter:
                 return "❌ That doesn't look like a valid timezone. Use a format like `Asia/Singapore` or `America/New_York`."
             self.db.upsert_user_setting(user_id, "timezone", value)
             return f"✅ Timezone updated to *{value}*."
-        return "❌ Unknown setting. Use `currency` or `timezone`."
+        if key in {"household", "family", "members"}:
+            parsed = self._parse_household_profile_text(
+                value,
+                current_profile=self._effective_household_profile(settings),
+                default_operation="replace",
+            )
+            if not parsed.get("ok"):
+                return "❌ Please describe your household like `3 adults 1 baby`, `2 adults 1 child`, or `4 people`."
+            profile = self._save_household_profile(user_id, settings, parsed["profile"])
+            return f"✅ Household updated to *{self._format_household_profile(profile)}*."
+        return "❌ Unknown setting. Use `currency`, `timezone`, or `household`."
 
     def _handle_onboarding(self, user_id: str, text: str, settings: dict | None, from_phone: str, recent_turns: list[dict]) -> str:
         state = settings.get("onboarding_state") if settings else None
@@ -459,36 +694,31 @@ class AgentRouter:
                 ZoneInfo(tz)  # Will raise an exception if the timezone is not valid
                 self.db.upsert_user_setting(user_id, "timezone", tz)
                 self.db.upsert_user_setting(user_id, "onboarding_state", "await_family_size")
-                reply = "Got it! Lastly, how many people are in your household? (This helps me estimate your grocery needs!)"
+                reply = "Got it! Lastly, who is in your household for grocery planning? You can say `3 adults`, `2 adults 1 child`, or `3 adults 1 baby`."
             except Exception:
                 reply = "That doesn't look like a valid timezone. Please use a format like 'Asia/Singapore', 'Asia/Kolkata', or 'America/New_York'."
 
         elif state == "await_family_size":
-            word_map = {
-                "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-                "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-                "ek": "1", "do": "2", "teen": "3", "char": "4", "chaar": "4",
-                "paanch": "5", "panch": "5", "che": "6", "chah": "6", "saat": "7",
-                "aath": "8", "nau": "9", "das": "10", "एक": "1", "दो": "2", "तीन": "3", "चार": "4"
-            }
-            processed_text = text.strip().lower()
-            for word, digit in word_map.items():
-                processed_text = re.sub(rf"\b{word}\b", digit, processed_text)
-            
-            digits = "".join(filter(str.isdigit, processed_text))
-            if not digits or int(digits) < 1:
-                reply = "Please enter a valid number (e.g., 2, 4)."
+            parsed = self._parse_household_profile_text(text, default_operation="replace")
+            if not parsed.get("ok"):
+                reply = "Please describe your household like `3 adults`, `2 adults 1 child`, or `3 adults 1 baby`. You can also say `4 people`."
             else:
-                self.db.upsert_user_setting(user_id, "family_size", digits)
+                profile = self._save_household_profile(user_id, settings, parsed["profile"])
+                family_size = self._profile_total(profile)
+                household_summary = self._format_household_profile(profile)
 
                 # Check if they already joined a household via an invite code
                 if settings and settings.get("active_household_id"):
                     hh_id = settings["active_household_id"]
                     if self.db.get_household_family_size(hh_id) is None:
-                        self.db.set_household_family_size(hh_id, int(digits))
+                        self.db.set_household_profile(
+                            hh_id,
+                            json.dumps(profile, sort_keys=True, separators=(",", ":")),
+                            family_size,
+                        )
                     self.db.upsert_user_setting(user_id, "onboarding_state", "complete")
                     reply = (
-                        "Done! ✅ You’re all set.\n\n"
+                        f"Done! ✅ Household: *{household_summary}*. You’re all set.\n\n"
                         "Try something simple:\n"
                         "• “Remind me to call mom tomorrow at 10”\n"
                         "• “Add milk to my shopping list”\n"
@@ -497,11 +727,12 @@ class AgentRouter:
                 else:
                     self.db.upsert_user_setting(user_id, "onboarding_state", "await_first_action")
                     reply = (
-                        "Done! ✅ You’re all set.\n\n"
+                        f"Done! ✅ Household: *{household_summary}*. You’re all set.\n\n"
                         "Try something simple:\n"
                         "• “Remind me to call mom tomorrow at 10”\n"
                         "• “Add milk to my shopping list”\n"
                         "• “Log $20 for lunch”\n\n"
+                        "You can refine the household now, like “and 1 baby also”, or update it later with `/settings household 3 adults 1 baby`.\n\n"
                         "Note: You can use this solo, or with friends, family, and teammates. I can also create a shared space for you in seconds whenever you're ready."
                     )
 
