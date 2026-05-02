@@ -157,6 +157,8 @@ def _start_reminder_thread() -> None:
                 due = db.get_due_reminders()
                 for reminder in due:
                     text = f"Reminder: {reminder.message}"
+                    # Mark as sent FIRST to prevent infinite retry loops if Meta rejects the template
+                    db.mark_reminder_sent(reminder.id)
                     try:
                         last_inbound = db.get_last_inbound_time(reminder.user_id)
                         if _is_within_24h(last_inbound):
@@ -164,7 +166,6 @@ def _start_reminder_thread() -> None:
                         else:
                             # Use pre-approved template for messages outside 24h window
                             send_template_message(reminder.user_id, "reminder_v1", [reminder.message[:1024]])
-                        db.mark_reminder_sent(reminder.id)
                         logger.info("reminder_sent id=%s user=%s", reminder.id, reminder.user_id)
                     except Exception as exc:
                         logger.exception("reminder_send_failed id=%s err=%s", reminder.id, exc)
@@ -281,6 +282,10 @@ def _handle_message(msg: dict) -> None:
                 send_text_message(sender, "Too many messages. Please wait a minute.")
             except Exception:
                 logger.exception("rate_limit_reply_failed")
+            return
+
+        # Silently ignore reactions, statuses, and system messages without spamming the user
+        if msg_type in ("reaction", "system", "status", "ephemeral", "interactive"):
             return
 
         if msg_type not in ("text", "audio", "image", "document"):

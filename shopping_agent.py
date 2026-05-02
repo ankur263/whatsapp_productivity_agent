@@ -16,7 +16,7 @@ class ShoppingAgent:
         from tools import TOOLS, TOOL_DESCRIPTIONS
         user_id = bundle["user_id"]
         user_settings = bundle.get("user_settings", {})
-        family_size = user_settings.get("family_size", 1)
+        family_size = bundle.get("family_size") or user_settings.get("family_size", 1)
 
         def mark_multiple_bought(item_numbers: str) -> str:
             """Marks multiple grocery items as bought. Args: comma-separated item numbers (e.g. '1, 3, 5')."""

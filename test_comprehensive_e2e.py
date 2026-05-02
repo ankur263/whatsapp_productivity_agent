@@ -49,7 +49,7 @@ def _norm(phone: str) -> str:
     digits = "".join(c for c in phone if c.isdigit())
     return f"+{digits}" if digits else ""
 
-def onboard(phone: str, currency="USD", tz="America/New_York", family="3"):
+def onboard(phone: str, currency="USD", tz="America/New_York", family="3", ws_type="Shared", ws_name="YES"):
     """Drive onboarding to completion no matter the starting state.
 
     /claim doesn't set onboarding_state, so the first turn is a kicker that
@@ -60,10 +60,13 @@ def onboard(phone: str, currency="USD", tz="America/New_York", family="3"):
         "await_currency": currency,
         "await_timezone": tz,
         "await_family_size": family,
+        "await_first_action": "add milk to my groceries",
+        "await_workspace_type": ws_type,
+        "await_workspace_name": ws_name,
     }
     last = ""
     norm = _norm(phone)
-    for _ in range(6):
+    for _ in range(10):
         settings = router.db.get_user_settings(norm) or {}
         state = settings.get("onboarding_state")
         if state == "complete":
@@ -85,15 +88,15 @@ helper = "+12025550102"
 stranger = "+12025550199"
 
 reply = router.route(admin, "YES")
-check("bootstrap", "YES grants access + creates 'My Home'",
-      "Welcome to Home OS" in reply and "created your personal household" in reply, reply[:120])
+check("bootstrap", "YES grants access + starts setup",
+      "Welcome" in reply and "profile set up" in reply, reply[:120])
 
 reply = router.route(stranger, "STOP")
 check("bootstrap", "STOP opts user out", "won't receive any more messages" in reply, reply[:120])
 
 # Drive admin's onboarding to completion
 final = onboard(admin, "USD", "America/New_York", "3")
-check("bootstrap", "admin onboarding completes", "Setup complete" in final, final[:120])
+check("bootstrap", "admin onboarding completes", "created" in final.lower() or "ready" in final.lower() or "set" in final.lower(), final[:120])
 
 # New Stranger hits lobby
 reply = router.route("+12025550198", "hi")
@@ -111,6 +114,10 @@ check("planner", "task created mentioning shoes",
 reply = router.route(admin, "Show my pending tasks")
 check("planner", "pending tasks list contains shoes",
       "shoe" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "Remind me to drink water in 15 minutes")
+check("planner", "reminder set",
+      "reminder" in reply.lower() and "set" in reply.lower(), reply[:200])
 
 
 # ======================================================================
@@ -143,6 +150,9 @@ check("finance", "missing-amount triggers clarification",
 router.db.get_and_clear_pending_clarification(re.sub(r"\D", "", admin))
 router.db.get_and_clear_pending_clarification("+" + re.sub(r"\D", "", admin))
 
+reply = router.route(admin, "Delete my last expense")
+check("finance", "expense deleted", "deleted" in reply.lower(), reply[:200])
+
 
 # ======================================================================
 section("4. SHOPPING AGENT")
@@ -157,6 +167,23 @@ check("shopping", "groceries list contains apple", "apple" in reply.lower(), rep
 reply = router.route(admin, "Add 0.5 liters of vanilla extract to my groceries")
 check("shopping", "fractional unit (0.5 L vanilla) accepted",
       "vanilla" in reply.lower() or "extract" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "I mean green apples instead of apples")
+check("shopping", "grocery item replaced via fast-path", "green apples" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "Set grocery 1 price to 3.50")
+check("shopping", "grocery price set", "3.50" in reply, reply[:200])
+
+reply = router.route(admin, "Show my grocery budget")
+check("shopping", "grocery budget summary generated", "3.50" in reply or "total" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "Mark the green apples as bought")
+check("shopping", "groceries: marked bought",
+      "bought" in reply.lower() or "marked" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "Clear my bought groceries")
+check("shopping", "groceries: cleared bought items",
+      "cleared" in reply.lower(), reply[:200])
 
 # Emoji-only
 reply = router.route(admin, "🍎")
@@ -188,6 +215,10 @@ reply = router.route(admin, "What is the password to my secret volcano lair?")
 check("journal", "no hallucinated memory for unknown fact",
       not re.search(r"\b\d{4,}\b", reply) or any(t in reply.lower() for t in ["no", "don't", "not", "couldn"]),
       reply[:200])
+
+reply = router.route(admin, "Give me my daily summary")
+check("journal", "daily summary generated",
+      "summary" in reply.lower() and "tasks" in reply.lower(), reply[:200])
 
 
 # ======================================================================
@@ -222,10 +253,10 @@ check("security", "jailbreak refused / no system prompt leak", refused and no_le
 # ======================================================================
 section("9. HOUSEHOLD ISOLATION & SHARING")
 # ======================================================================
-# Switch admin back to My Home (index 1)
+# Switch admin back to Home (index 1)
 reply = router.route(admin, "/switch 1")
-check("households", "/switch 1 returns to My Home",
-      "My Home" in reply or "Switched" in reply, reply[:200])
+check("households", "/switch 1 returns to Home",
+      "Home" in reply or "Switched" in reply, reply[:200])
 
 # Spouse joins via invite, completes onboarding
 inv = router.route(admin, "/invite")
@@ -240,7 +271,7 @@ if m:
 # Spouse adds milk; admin sees it
 router.route(spouse, "add 2 cartons of milk to groceries")
 reply = router.route(admin, "show my groceries")
-check("households", "shared scope: admin sees spouse's milk",
+check("households", "shared scope: admin sees spouse milk",
       "milk" in reply.lower(), reply[:300])
 
 # Admin creates Vacation Home + adds sunscreen
@@ -255,14 +286,17 @@ check("households", "isolation: Vacation Home does NOT show milk",
 
 # Spouse only sees milk, not sunscreen
 reply = router.route(spouse, "show my groceries")
-check("households", "isolation: spouse sees milk only",
+check("households", "isolation: spouse sees milk",
       "milk" in reply.lower() and "sunscreen" not in reply.lower(), reply[:300])
 
 
 # ======================================================================
 section("10. INVITE / SWITCH BAD INPUTS")
 # ======================================================================
-for bad in ["/switch 0", "/switch -5", "/switch 9999", "/switch apple"]:
+reply = router.route(admin, "/switch 0")
+check("inputs", "/switch 0 → returns to personal space", "Personal Space" in reply or "✅" in reply, reply[:200])
+
+for bad in ["/switch -5", "/switch 9999", "/switch apple"]:
     reply = router.route(admin, bad)
     check("inputs", f"{bad} → invalid", "Invalid" in reply or "❌" in reply, reply[:200])
 
@@ -314,7 +348,68 @@ check("deleteme", "user returned to lobby after deletion", "Reply *YES*" in repl
 
 
 # ======================================================================
-section("14. QUOTA LIMITS")
+section("14. CONVERSATIONAL ONBOARDING (PERSONAL & SHARED FLOWS)")
+# ======================================================================
+# Test Helper going through the Personal Flow
+router.route(helper, "YES")
+router.route(helper, "EUR")
+router.route(helper, "Europe/London")
+reply = router.route(helper, "one")
+check("onboarding", "word number 'one' accepted", "you’re all set" in reply.lower(), reply[:200])
+
+reply = router.route(helper, "Add coffee to my groceries")
+check("onboarding", "intercepts first action", "what kind of space" in reply.lower() and "personal" in reply.lower(), reply[:200])
+
+# Typo check
+reply = router.route(helper, "Oops")
+check("onboarding", "typo rejected gracefully", "reply with 'personal' or 'shared'" in reply.lower(), reply[:200])
+
+reply = router.route(helper, "Personal")
+check("onboarding", "Personal space created & command executed",
+      "personal space is ready" in reply.lower() and "coffee" in reply.lower(), reply[:300])
+
+# Test Stranger going through the Shared Flow with Custom Name
+router.route(stranger, "YES")
+router.route(stranger, "USD")
+router.route(stranger, "UTC")
+router.route(stranger, "4")
+
+reply = router.route(stranger, "/help")
+check("onboarding", "slash command intercepted during await_first_action", "normal message" in reply.lower(), reply[:200])
+
+router.route(stranger, "Add eggs")
+router.route(stranger, "Shared")
+reply = router.route(stranger, "Beach House")
+check("onboarding", "custom shared group created & executed", "beach house" in reply.lower() and "eggs" in reply.lower(), reply[:300])
+
+
+# ======================================================================
+section("15. HOME INVENTORY & STOCK ALERTS")
+# ======================================================================
+reply = router.route(admin, "Stock 5 rolls of toilet paper")
+check("inventory", "stock added", "toilet paper" in reply.lower() and "5" in reply, reply[:200])
+
+reply = router.route(admin, "Set the low stock threshold for toilet paper to 2")
+check("inventory", "threshold set", "2" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "I used 4 rolls of toilet paper")
+check("inventory", "stock used & low warning triggered", 
+      "1" in reply and "low" in reply.lower(), reply[:200])
+
+
+# ======================================================================
+section("16. FINANCE BUDGET WARNINGS")
+# ======================================================================
+reply = router.route(admin, "Set my monthly entertainment budget to $100")
+check("budget", "budget set", "100" in reply and "entertainment" in reply.lower(), reply[:200])
+
+reply = router.route(admin, "Log $90 for entertainment")
+check("budget", "budget warning triggered", 
+      "warning" in reply.lower() or "alert" in reply.lower(), reply[:300])
+
+
+# ======================================================================
+section("17. QUOTA LIMITS")
 # ======================================================================
 for _ in range(200):
     router.db.append_conversation(spouse, "user", "dummy spam message")

@@ -45,7 +45,7 @@ class FinanceAgent:
                 return f"Invalid category '{category}'. Must be one of: {', '.join(CATEGORY_MAP)}"
 
             # Store amount in minor units (cents/paise)
-            amount_minor = int(amount * 100)
+            amount_minor = int(round(amount * 100))
             final_currency = (currency or default_currency).upper()
 
             # Anomaly Detection (Calculate before logging so new expense isn't included in avg)
@@ -95,7 +95,7 @@ class FinanceAgent:
             if category.lower() not in CATEGORY_MAP:
                 return f"Invalid category '{category}'. Must be one of: {', '.join(CATEGORY_MAP)}"
             
-            amount_minor = int(amount * 100)
+            amount_minor = int(round(amount * 100))
             final_currency = (currency or default_currency).upper()
             
             db.set_budget(user_id, category.lower(), amount_minor, final_currency)
@@ -110,7 +110,7 @@ class FinanceAgent:
                 count = 0
                 for item in data:
                     amount = item.get("amount")
-                    category = item.get("category", "other").lower()
+                    category = str(item.get("category") or "other").lower()
                     merchant = item.get("merchant")
                     currency = item.get("currency", default_currency)
                     
@@ -120,7 +120,7 @@ class FinanceAgent:
                     if amount is not None:
                         db.log_expense(
                             user_id=user_id,
-                            amount_minor=int(float(amount) * 100),
+                            amount_minor=int(round(float(amount) * 100)),
                             currency=str(currency).upper(),
                             category=category,
                             merchant=str(merchant) if merchant else None,

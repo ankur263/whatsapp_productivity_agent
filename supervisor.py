@@ -12,6 +12,14 @@ from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger(__name__)
 
+def _clean_json_text(text: str) -> str:
+    """Strips Markdown formatting that LLMs sometimes hallucinate around JSON output."""
+    text = text.strip()
+    if text.startswith("```json"): text = text[7:]
+    elif text.startswith("```"): text = text[3:]
+    if text.endswith("```"): text = text[:-3]
+    return text.strip()
+
 class PlanStep(BaseModel):
     agent: str = Field(description="Specialist agent: 'planner', 'finance', 'shopping', 'events', 'knowledge', 'journal'")
     subrequest: str = Field(description="The specific request for this specialist")
@@ -66,6 +74,8 @@ Output format instructions:
 - If the message is a simple greeting or trivial question (like asking the time), return kind="reply" with the "text".
 - If the message requires exactly one specialist, return kind="route" with the "agent" name and a clear "subrequest".
 - If the message contains multiple independent tasks, return kind="plan" with a list of "steps".
+- If the message is off-task chat, abuse, or random text, return kind="reply" with a short helpful guidance message that suggests supported commands.
+- Never repeat the user's exact input text as your reply. Do not parrot.
 
 Be strictly compliant with the JSON schema.
 
@@ -140,7 +150,8 @@ class SupervisorAgent:
                     generation_config=config
                 )
                 text = response.text or ""
-                return SupervisorOutput.model_validate_json(text)
+                clean_text = _clean_json_text(text)
+                return SupervisorOutput.model_validate_json(clean_text)
             except ValidationError as e:
                 logger.warning("Supervisor validation failed on attempt %d: %s", attempt + 1, e)
                 current_prompt += f"\n\nSystem Error on previous attempt:\n{e}\nPlease correct the JSON output."
@@ -183,8 +194,8 @@ class SupervisorAgent:
                 if resp.status_code != 200:
                     raise Exception(f"HTTP {resp.status_code}: {resp.text}")
                 data = resp.json()
-                text = data["choices"][0]["message"]["content"]
-                return SupervisorOutput.model_validate_json(text)
+                text = data["choices"][0]["message"]["content"] or ""
+                return SupervisorOutput.model_validate_json(_clean_json_text(text))
             except ValidationError as e:
                 logger.warning("Supervisor validation failed on attempt %d: %s", attempt + 1, e)
                 current_prompt += f"\n\nSystem Error on previous attempt:\n{e}\nPlease correct the JSON output."

@@ -35,3 +35,9 @@ if match:
     print("Reply:", router.route(helper_phone, f"/join {code}"))
 else:
     print("Failed to extract invite code!")
+
+print("\n=== 6. ADMIN TRIES TO LEAVE A HOUSEHOLD THEY OWN ===")
+reply = router.route(admin_phone, "/leave 1")
+print("Reply:", reply)
+assert "last owner" in reply.lower() or "cannot leave" in reply.lower()
+print("✅ Admin was safely prevented from leaving a household they own.")

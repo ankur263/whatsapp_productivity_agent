@@ -50,7 +50,10 @@ def _parse_int(value: str) -> int:
 
 
 def _parse_float(value: str) -> float:
-    return float(value.strip())
+    val = float(value.strip())
+    if math.isnan(val) or math.isinf(val):
+        raise ValueError("Value cannot be NaN or Infinity.")
+    return val
 
 
 def _strip_quotes(value: str) -> str:
@@ -361,7 +364,6 @@ _SAFE_OPS = {
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
     ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
     ast.Mod: operator.mod,
     ast.USub: operator.neg,
 }
@@ -402,8 +404,15 @@ def wikipedia_summary(topic: str) -> str:
         return f"Wikipedia lookup failed: {exc}"
 
 
-def get_current_time(_: str = "") -> str:
-    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+def get_current_time(arg: str = "", user_id: str = "") -> str:
+    settings = TASK_DB.get_user_settings(user_id) or {}
+    tz_str = settings.get("timezone", "UTC")
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_str)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz).strftime("%Y-%m-%d %I:%M %p %Z")
 
 
 def create_task(arg: str, user_id: str) -> str:
@@ -662,9 +671,19 @@ def _ordered_grocery_rows_for_display(user_id: str, status: str | None) -> list[
 
 
 def _resolve_grocery_ref(user_id: str, number_text: str, preferred_status: str = "pending") -> dict | None:
+    clean_text = _strip_quotes(number_text).strip()
     try:
-        ref_num = _parse_int(_strip_quotes(number_text))
+        ref_num = _parse_int(clean_text)
     except Exception:
+        # Fallback for AI tools: If AI passes a string name instead of an ID, fuzzy match it
+        target_name = _normalize_grocery_name(clean_text)
+        if target_name:
+            pending = TASK_DB.list_grocery_items(user_id=user_id, status=preferred_status)
+            for row in pending:
+                if target_name in _normalize_grocery_name(str(row.get("item_name", ""))):
+                    row = dict(row)
+                    row["_ref_mode"] = "fuzzy_name"
+                    return row
         return None
 
     preferred_rows = _ordered_grocery_rows_for_display(user_id, preferred_status)
@@ -826,7 +845,7 @@ def _parse_meal_list(arg: str) -> list[str]:
     text = _strip_quotes(arg).strip().lower()
     if not text:
         return []
-    text = re.sub(r"\b(and|&)\b", ",", text)
+    text = re.sub(r"\b(and)\b|\s+&\s+", ",", text)
     raw_parts = [p.strip() for p in text.split(",") if p.strip()]
     return raw_parts
 
@@ -885,7 +904,7 @@ def record_store_price(arg: str, user_id: str) -> str:
         price_text = parts[2]
     else:
         m = re.match(
-            r"^(.+?)\s+at\s+([a-zA-Z ]+)\s+\$?([0-9]+(?:\.[0-9]+)?)$",
+            r"^(.+?)\s+at\s+(.+?)\s+\$?([0-9]+(?:\.[0-9]+)?)$",
             text,
             flags=re.IGNORECASE,
         )
@@ -957,7 +976,8 @@ def suggest_grocery_run(arg: str, user_id: str) -> str:
     if not store_totals:
         return "Not enough historical price data to optimize this basket. Try uploading more receipt photos!"
         
-    sorted_stores = sorted(store_totals.items(), key=lambda x: x[1])
+    # Sort by MOST items found (descending), then by CHEAPEST total cost (ascending)
+    sorted_stores = sorted(store_totals.items(), key=lambda x: (-items_found[x[0]], x[1]))
     best_store = sorted_stores[0][0]
     
     lines = ["🛒 **Smart Basket Optimization** (Based on recent receipts):"]
@@ -1261,7 +1281,7 @@ TOOLS: dict[str, Callable[[str, str], str]] = {
     "web_search": lambda arg, _uid: web_search(_strip_quotes(arg)),
     "calculate": lambda arg, _uid: calculate(_strip_quotes(arg)),
     "wikipedia_summary": lambda arg, _uid: wikipedia_summary(_strip_quotes(arg)),
-    "get_current_time": lambda arg, _uid: get_current_time(_strip_quotes(arg)),
+        "get_current_time": lambda arg, uid: get_current_time(_strip_quotes(arg), uid),
     "create_task": create_task,
     "list_tasks": list_tasks,
     "complete_task": complete_task,

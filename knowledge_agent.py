@@ -13,11 +13,12 @@ class KnowledgeAgent:
     def handle(self, bundle: dict) -> dict:
         from tools import web_search, calculate, wikipedia_summary, get_current_time
         
+        user_id = bundle["user_id"]
         local_tools = {
             "web_search": lambda query: web_search(query),
             "calculate": lambda expression: calculate(expression),
             "wikipedia_summary": lambda topic: wikipedia_summary(topic),
-            "get_current_time": lambda: get_current_time()
+            "get_current_time": lambda: get_current_time("", user_id)
         }
 
         openai_tools = [

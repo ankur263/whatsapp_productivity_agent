@@ -8,10 +8,10 @@
 | VM name | `whatsapp-agent` |
 | VM zone | `us-central1-a` |
 | Machine type | `e2-micro` (always-free tier) |
-| Public IP | `34.45.145.204` |
-| Domain | `whatsapp-productivity-agent.duckdns.org` |
-| Webhook URL | `https://whatsapp-productivity-agent.duckdns.org/webhook` |
-| Health URL | `https://whatsapp-productivity-agent.duckdns.org/health` |
+| Public IP | Ephemeral (changes on VM stop/start) |
+| Domain | `homeos-bot.duckdns.org` |
+| Webhook URL | `https://homeos-bot.duckdns.org/webhook` |
+| Health URL | `https://homeos-bot.duckdns.org/health` |
 | Reverse proxy | Caddy (auto Let's Encrypt cert) |
 | Container name | `whatsapp` |
 | Container port | `8000` (bound to `127.0.0.1` only — Caddy proxies) |
@@ -42,7 +42,7 @@ docker ps
 sudo systemctl status caddy --no-pager | head -10
 
 # Test the endpoint from anywhere
-curl https://whatsapp-productivity-agent.duckdns.org/health
+curl https://homeos-bot.duckdns.org/health
 ```
 
 ## Push a code change
@@ -56,7 +56,7 @@ tar --exclude='venv' --exclude='venv311' --exclude='__pycache__' \
 gcloud compute scp /tmp/app.tgz whatsapp-agent:~/app.tgz --zone=us-central1-a
 ```
 
-**Then SSH in and run:**
+**Then SSH in and run:** gcloud compute ssh whatsapp-agent --zone=us-central1-a 
 ```bash
 cd ~/app && tar -xzf ~/app.tgz
 docker build -t whatsapp-agent .
@@ -113,6 +113,24 @@ gcloud compute instances describe whatsapp-agent \
 ```
 
 Then update it at https://www.duckdns.org (paste IP into your domain row, click "update ip").
+
+### Auto-heal DuckDNS every 5 minutes (recommended)
+
+Run on VM after pulling this repo into `~/app`:
+
+```bash
+cd ~/app
+chmod +x scripts/duckdns_update.sh scripts/install_duckdns_cron.sh
+./scripts/install_duckdns_cron.sh homeos-bot <YOUR_DUCKDNS_TOKEN>
+```
+
+Quick verify:
+
+```bash
+~/app/scripts/duckdns_update.sh
+tail -n 5 ~/.duckdns/duck.log
+crontab -l | grep duckdns_update.sh
+```
 
 To make the IP permanent (~$3/mo if VM is ever stopped, free while running):
 ```bash
