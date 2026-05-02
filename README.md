@@ -8,7 +8,7 @@ Production-style AI productivity agent built from scratch on this machine.
 - Transport: Meta WhatsApp Cloud API
 - Tunnel (local dev): ngrok
 
-## 1) Project Layout
+## 1) Project Layout :-
 
 ```text
 whatsapp_productivity_agent/
